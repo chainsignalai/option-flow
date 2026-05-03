@@ -1,15 +1,17 @@
 import os
 import sys
 import json
+import time
 import argparse
 import logging
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 from enum import Enum
 import httpx
 from dotenv import load_dotenv
+import db as persistence
 
 load_dotenv()
 
@@ -40,7 +42,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 ETF_BLACKLIST = {
-    "SPY", "QQQ", "IWM", "DIA", "SPX", "XSP", "VIX",
+    "SPY", "QQQ", "IWM", "DIA", "SPX", "XSP", "SPXW", "VIX",
     "UVXY", "SQQQ", "TQQQ", "XLF", "XLE", "XLK", "GLD",
     "SLV", "TLT", "HYG", "EEM", "ARKK", "KWEB",
 }
@@ -173,23 +175,46 @@ class StrategyResult:
     live_enhancements: list = field(default_factory=list)               # live WebSocket enhancement details for notifications
 
 
+@dataclass
+class BacktestTrade:
+    ticker: str = ""
+    date: str = ""
+    direction: str = ""
+    conviction: str = ""
+    composite_score: float = 0.0
+    entry_price: float = 0.0
+    exit_price: float = 0.0
+    return_pct: float = 0.0
+    win: bool = False
+    regime: str = ""
+    layer_signals: dict = field(default_factory=dict)
+    layer_scores: dict = field(default_factory=dict)
+
+
 # ---------------------------------------------------------------------------
 # API helpers
 # ---------------------------------------------------------------------------
 
-def uw_get(path: str, params: dict = None) -> dict:
-    """Make authenticated GET to Unusual Whales API."""
+def uw_get(path: str, params: dict = None, _retries: int = 3) -> dict:
+    """Make authenticated GET to Unusual Whales API with retry on rate limit."""
     url = f"{UW_BASE}{path}"
-    try:
-        resp = httpx.get(url, params=params or {}, timeout=30, headers=HEADERS)
-        resp.raise_for_status()
-        return resp.json()
-    except httpx.HTTPStatusError as e:
-        log.error(f"UW API error {e.response.status_code}: {path}")
-        return {}
-    except Exception as e:
-        log.error(f"UW API request failed: {e}")
-        return {}
+    for attempt in range(_retries):
+        try:
+            resp = httpx.get(url, params=params or {}, timeout=30, headers=HEADERS)
+            if resp.status_code == 429 and attempt < _retries - 1:
+                wait = 2 ** (attempt + 1)
+                log.warning(f"UW API rate limited (429), waiting {wait}s... (attempt {attempt+1}/{_retries})")
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        except httpx.HTTPStatusError as e:
+            log.error(f"UW API error {e.response.status_code}: {path}")
+            return {}
+        except Exception as e:
+            log.error(f"UW API request failed: {e}")
+            return {}
+    return {}
 
 def _float(val, default=0.0):
     """Safe float — handles None, empty strings, and non-numeric values from API."""
@@ -213,6 +238,57 @@ def _str(val, default=""):
         return default
     return str(val)
 
+def _find_point_by_date(points: list, target_date: str, strict_before: bool = False) -> dict:
+    """Find data point matching target_date in a time series array.
+    If strict_before=True, returns the last point BEFORE target_date (for lookahead-safe backtesting).
+    Falls back to closest preceding date if exact match not found."""
+    if not points:
+        return {}
+    if not target_date:
+        return points[-1]
+    for pt in reversed(points):
+        pt_date = pt.get("date", "")[:10]
+        if strict_before and pt_date < target_date:
+            return pt
+        elif not strict_before and pt_date <= target_date:
+            return pt
+    return points[0]
+
+def get_trading_days(start_date: str, end_date: str) -> list[str]:
+    """Return actual trading days from SPY OHLC data (handles holidays correctly)."""
+    spy_prices = fetch_ohlc_prices("SPY", end_date)
+    days = sorted(d for d in spy_prices if start_date <= d <= end_date)
+    if not days:
+        log.warning("No SPY OHLC data found — falling back to weekday calendar")
+        start = datetime.strptime(start_date, "%Y-%m-%d").date()
+        end = datetime.strptime(end_date, "%Y-%m-%d").date()
+        current = start
+        while current <= end:
+            if current.weekday() < 5:
+                days.append(current.strftime("%Y-%m-%d"))
+            current += timedelta(days=1)
+    return days
+
+def fetch_ohlc_prices(ticker: str, end_date: str) -> dict[str, dict]:
+    """Fetch daily OHLC and return {date: {open, high, low, close}} for regular session only."""
+    data = uw_get(f"/api/stock/{ticker}/ohlc/1d", {"end_date": end_date, "limit": 2500})
+    candles = data.get("data", [])
+    prices = {}
+    for c in candles:
+        if c.get("market_time") != "r":
+            continue
+        d = c.get("date", "")[:10]
+        close = _float(c.get("close"))
+        opn = _float(c.get("open"))
+        if d and close > 0:
+            prices[d] = {
+                "open": opn,
+                "high": _float(c.get("high")),
+                "low": _float(c.get("low")),
+                "close": close,
+            }
+    return prices
+
 # ---------------------------------------------------------------------------
 # Strategy/Layer 1: The "Smart Money Sweep" Scanner
 # This is the bread and butter. You're looking for aggressive sweeps (multi-exchange fills = urgency) on individual stocks, not ETFs. The filters that separate signal from noise:
@@ -228,7 +304,7 @@ def _str(val, default=""):
 # Layer 1: Flow Analysis
 # ---------------------------------------------------------------------------
 
-def analyze_flow(ticker: str) -> FlowScore: # analyze_flow function name, takes one argument type string. and returns FlowScore dataclass defined above.
+def analyze_flow(ticker: str, date: str = None) -> FlowScore: # analyze_flow function name, takes one argument type string. and returns FlowScore dataclass defined above.
     """
     Fetch unusual flow alerts and score conviction.
     Key filters:
@@ -245,18 +321,22 @@ def analyze_flow(ticker: str) -> FlowScore: # analyze_flow function name, takes 
     log.info(f"[FLOW] {ticker}: Fetching flow alerts (min_premium=$100K, OTM only, vol>OI)...")
 
     # Get flow alerts for ticker
-    data = uw_get("/api/option-trades/flow-alerts", {
+    params = {
         "ticker_symbol": ticker,
         "min_premium": 100_000,
         "size_greater_oi": True,
         "limit": 50,
-    })
+    }
+    if date:
+        params["newer_than"] = f"{date}T00:00:00"
+        params["older_than"] = f"{date}T23:59:59"
+    data = uw_get("/api/option-trades/flow-alerts", params)
     alerts = data.get("data", [])
     if not alerts:
         log.info(f"[FLOW] {ticker}: ❌ No significant flow alerts found — skipping layer")
         return fs
 
-    today = datetime.now().date()
+    today = datetime.strptime(date, "%Y-%m-%d").date() if date else datetime.now().date()
 
     # DTE buckets: 0-5 = short-term noise, 6-180 = sweet spot (UW recommended), 181+ = LEAPS/hedges
     DTE_WEIGHTS = {
@@ -453,7 +533,7 @@ def analyze_flow(ticker: str) -> FlowScore: # analyze_flow function name, takes 
 # Layer 2: Dark Pool Analysis
 # ---------------------------------------------------------------------------
 
-def analyze_darkpool(ticker: str) -> DarkpoolScore:
+def analyze_darkpool(ticker: str, date: str = None) -> DarkpoolScore:
     """
     Measure institutional dark pool activity level.
     Dark pool direction is structurally unreliable (most prints execute at midpoint),
@@ -463,7 +543,8 @@ def analyze_darkpool(ticker: str) -> DarkpoolScore:
     ds = DarkpoolScore()
     log.info(f"[DARK] {ticker}: Fetching dark pool block prints...")
 
-    data = uw_get(f"/api/darkpool/{ticker}")
+    dp_params = {"date": date} if date else {}
+    data = uw_get(f"/api/darkpool/{ticker}", dp_params)
     prints = data.get("data", [])
     if not prints:
         log.info(f"[DARK] {ticker}: ❌ No dark pool data returned — skipping layer")
@@ -555,7 +636,7 @@ def analyze_darkpool(ticker: str) -> DarkpoolScore:
 # Layer 3: Gamma Exposure (GEX)
 # ---------------------------------------------------------------------------
 
-def analyze_gex(ticker: str, current_price: float = None, prefetched_levels: list = None) -> GEXScore:
+def analyze_gex(ticker: str, current_price: float = None, prefetched_levels: list = None, date: str = None) -> GEXScore:
     """
     Identify key gamma levels:
         - Max gamma strike = price magnet (stocks pin here)
@@ -571,7 +652,8 @@ def analyze_gex(ticker: str, current_price: float = None, prefetched_levels: lis
     if prefetched_levels is not None:
         levels = prefetched_levels
     else:
-        data = uw_get(f"/api/stock/{ticker}/spot-exposures/strike")
+        gex_params = {"date": date} if date else {}
+        data = uw_get(f"/api/stock/{ticker}/spot-exposures/strike", gex_params)
         levels = data.get("data", [])
     if not levels:
         log.info(f"[GEX] {ticker}: ❌ No GEX data returned — skipping layer")
@@ -725,7 +807,7 @@ def analyze_gex(ticker: str, current_price: float = None, prefetched_levels: lis
 # Layer 4: IV Rank / Percentile
 # ---------------------------------------------------------------------------
 
-def analyze_iv(ticker: str) -> IVScore:
+def analyze_iv(ticker: str, date: str = None) -> IVScore:
     """
     Check implied volatility percentile.
     IV < 30th percentile = cheap options (good for buying)
@@ -734,7 +816,8 @@ def analyze_iv(ticker: str) -> IVScore:
     ivs = IVScore()
     log.info(f"[IV] {ticker}: Fetching implied volatility data...")
 
-    data = uw_get(f"/api/stock/{ticker}/interpolated-iv")
+    iv_params = {"date": date} if date else {}
+    data = uw_get(f"/api/stock/{ticker}/interpolated-iv", iv_params)
     iv_data = data.get("data", [])
     if not iv_data:
         log.info(f"[IV] {ticker}: ❌ No IV data returned — skipping layer")
@@ -826,7 +909,7 @@ def analyze_iv(ticker: str) -> IVScore:
 # Layer 5: Technical Indicators
 # ---------------------------------------------------------------------------
 
-def analyze_technicals(ticker: str, current_price: float = None) -> TechnicalScore:
+def analyze_technicals(ticker: str, current_price: float = None, date: str = None) -> TechnicalScore:
     """
     RSI(14) + SMA(20) vs SMA(50) trend alignment.
     
@@ -848,7 +931,8 @@ def analyze_technicals(ticker: str, current_price: float = None) -> TechnicalSco
     })
     rsi_points = rsi_data.get("data", [])
     if rsi_points:
-        ts.rsi_14 = _float(rsi_points[-1].get("values", {}).get("RSI"), 50)
+        rsi_pt = _find_point_by_date(rsi_points, date, strict_before=bool(date))
+        ts.rsi_14 = _float(rsi_pt.get("values", {}).get("RSI"), 50)
         if ts.rsi_14 < 30:
             log.info(f"[TECH] {ticker}: RSI(14) = {ts.rsi_14:.1f} — OVERSOLD (below 30, potential bounce)")
         elif ts.rsi_14 > 70:
@@ -868,7 +952,8 @@ def analyze_technicals(ticker: str, current_price: float = None) -> TechnicalSco
     })
     macd_points = macd_data.get("data", [])
     if macd_points:
-        latest_macd = macd_points[-1].get("values", {})
+        macd_pt = _find_point_by_date(macd_points, date, strict_before=bool(date))
+        latest_macd = macd_pt.get("values", {})
         macd_val = _float(latest_macd.get("MACD"))
         signal_val = _float(latest_macd.get("MACD_Signal"))
         ts.macd_histogram = _float(latest_macd.get("MACD_Hist"), macd_val - signal_val)
@@ -894,7 +979,8 @@ def analyze_technicals(ticker: str, current_price: float = None) -> TechnicalSco
     })
     sma20_points = sma20_data.get("data", [])
     if sma20_points:
-        ts.sma_20 = _float(sma20_points[-1].get("values", {}).get("SMA"))
+        sma20_pt = _find_point_by_date(sma20_points, date, strict_before=bool(date))
+        ts.sma_20 = _float(sma20_pt.get("values", {}).get("SMA"))
         log.info(f"[TECH] {ticker}: SMA(20) = ${ts.sma_20:.2f}")
     else:
         log.warning(f"[TECH] {ticker}: ⚠️ SMA(20) data unavailable")
@@ -908,7 +994,8 @@ def analyze_technicals(ticker: str, current_price: float = None) -> TechnicalSco
     })
     sma50_points = sma50_data.get("data", [])
     if sma50_points:
-        ts.sma_50 = _float(sma50_points[-1].get("values", {}).get("SMA"))
+        sma50_pt = _find_point_by_date(sma50_points, date, strict_before=bool(date))
+        ts.sma_50 = _float(sma50_pt.get("values", {}).get("SMA"))
         log.info(f"[TECH] {ticker}: SMA(50) = ${ts.sma_50:.2f}")
     else:
         log.warning(f"[TECH] {ticker}: ⚠️ SMA(50) data unavailable")
@@ -920,7 +1007,8 @@ def analyze_technicals(ticker: str, current_price: float = None) -> TechnicalSco
     })
     vwap_points = vwap_data.get("data", [])
     if vwap_points:
-        ts.vwap = _float(vwap_points[-1].get("values", {}).get("VWAP"))
+        vwap_pt = _find_point_by_date(vwap_points, date, strict_before=bool(date))
+        ts.vwap = _float(vwap_pt.get("values", {}).get("VWAP"))
         log.info(f"[TECH] {ticker}: VWAP = ${ts.vwap:.2f}")
     else:
         log.warning(f"[TECH] {ticker}: ⚠️ VWAP data unavailable")
@@ -1046,7 +1134,7 @@ def analyze_technicals(ticker: str, current_price: float = None) -> TechnicalSco
 # Layer 6: Catalyst Detection
 # ---------------------------------------------------------------------------
 
-def analyze_catalyst(ticker: str, flow: FlowScore = None) -> CatalystScore:
+def analyze_catalyst(ticker: str, flow: FlowScore = None, date: str = None) -> CatalystScore:
     """
     Check for upcoming earnings or other catalysts.
     Direction-agnostic: scores event MAGNITUDE (how likely is a big move), not direction.
@@ -1062,7 +1150,7 @@ def analyze_catalyst(ticker: str, flow: FlowScore = None) -> CatalystScore:
 
     if earnings:
         log.info(f"[CAT] {ticker}: Found {len(earnings)} earnings records")
-        today = datetime.now().date()
+        today = datetime.strptime(date, "%Y-%m-%d").date() if date else datetime.now().date()
 
         # Find nearest future earnings date
         nearest_date = None
@@ -1217,7 +1305,7 @@ def analyze_catalyst(ticker: str, flow: FlowScore = None) -> CatalystScore:
 APEWISDOM_BASE = "https://apewisdom.io/api/v1.0"
 
 
-def analyze_social(ticker: str) -> SocialScore:
+def analyze_social(ticker: str, date: str = None) -> SocialScore:
     """
     Check social buzz on Reddit (WSB, r/stocks, r/options) via ApeWisdom.
     
@@ -1231,6 +1319,9 @@ def analyze_social(ticker: str) -> SocialScore:
     High buzz + strong flow + dark pool = institutional + retail aligned = high conviction.
     """
     ss = SocialScore()
+    if date:
+        log.info(f"[SOCIAL] {ticker}: Skipped — no historical social data available (backtest mode)")
+        return ss
     ticker = ticker.upper()
     log.info(f"[SOCIAL] {ticker}: Fetching social sentiment from Reddit (WSB, r/stocks, r/options)...")
 
@@ -1503,34 +1594,36 @@ def compute_composite(result: StrategyResult) -> StrategyResult:
 # Main analysis pipeline
 # ---------------------------------------------------------------------------
 
-def analyze_ticker(ticker: str) -> StrategyResult:
-    """Run all 7 layers of analysis on a single ticker."""
+def analyze_ticker(ticker: str, date: str = None) -> StrategyResult:
+    """Run all 7 layers of analysis on a single ticker. Pass date='YYYY-MM-DD' for backtest mode."""
     ticker = ticker.upper()
+    ts_label = date or datetime.now().isoformat()
     log.info(f"\n{'='*60}")
     log.info(f"  🔍 ANALYZING: {ticker}")
-    log.info(f"  📅 Timestamp: {datetime.now().isoformat()}")
+    log.info(f"  📅 {'Date' if date else 'Timestamp'}: {ts_label}")
     log.info(f"{'='*60}")
 
     result = StrategyResult(
         ticker=ticker,
-        timestamp=datetime.now().isoformat(),
+        timestamp=ts_label,
     )
 
     # Layer 1: Flow
     log.info(f"\n[PIPELINE] {ticker}: ── Layer 1/7: OPTIONS FLOW ──")
-    result.flow = analyze_flow(ticker)
+    result.flow = analyze_flow(ticker, date=date)
 
     # Layer 2: Dark Pool
     log.info(f"\n[PIPELINE] {ticker}: ── Layer 2/7: DARK POOL ──")
-    result.darkpool = analyze_darkpool(ticker)
+    result.darkpool = analyze_darkpool(ticker, date=date)
 
     # Layer 4: IV
     log.info(f"\n[PIPELINE] {ticker}: ── Layer 4/7: IMPLIED VOLATILITY ──")
-    result.iv = analyze_iv(ticker)
+    result.iv = analyze_iv(ticker, date=date)
 
     # Layer 3: GEX — also extracts current price from spot-exposures data
     log.info(f"\n[PIPELINE] {ticker}: ── Layer 3/7: GAMMA EXPOSURE (GEX) ──")
-    gex_raw = uw_get(f"/api/stock/{ticker}/spot-exposures/strike")
+    gex_params = {"date": date} if date else {}
+    gex_raw = uw_get(f"/api/stock/{ticker}/spot-exposures/strike", gex_params)
     gex_levels = gex_raw.get("data", [])
 
     current_price = None
@@ -1543,19 +1636,19 @@ def analyze_ticker(ticker: str) -> StrategyResult:
     if not current_price:
         log.warning(f"[PIPELINE] {ticker}: ⚠️ Could not determine price — VWAP and GEX scoring limited")
 
-    result.gex = analyze_gex(ticker, current_price, prefetched_levels=gex_levels)
+    result.gex = analyze_gex(ticker, current_price, prefetched_levels=gex_levels, date=date)
 
     # Layer 5: Technicals (needs current_price for VWAP comparison)
     log.info(f"\n[PIPELINE] {ticker}: ── Layer 5/7: TECHNICALS ──")
-    result.technicals = analyze_technicals(ticker, current_price=current_price)
+    result.technicals = analyze_technicals(ticker, current_price=current_price, date=date)
 
     # Layer 6: Catalyst
     log.info(f"\n[PIPELINE] {ticker}: ── Layer 6/7: CATALYST DETECTION ──")
-    result.catalyst = analyze_catalyst(ticker, flow=result.flow)
+    result.catalyst = analyze_catalyst(ticker, flow=result.flow, date=date)
 
     # Layer 7: Social Sentiment (Reddit WSB, r/stocks, Twitter/X)
     log.info(f"\n[PIPELINE] {ticker}: ── Layer 7/7: SOCIAL SENTIMENT ──")
-    result.social = analyze_social(ticker)
+    result.social = analyze_social(ticker, date=date)
 
     # Composite
     log.info(f"\n[PIPELINE] {ticker}: ── COMPUTING COMPOSITE SCORE ──")
@@ -1565,19 +1658,30 @@ def analyze_ticker(ticker: str) -> StrategyResult:
 
     return result
 
-def scan_flow_for_candidates(min_premium: int = 100_000, limit: int = 50) -> list[str]:
+def scan_flow_for_candidates(min_premium: int = 100_000, limit: int = 50, date: str = None) -> list[str]:
     """
     Scan the market-wide flow alerts to find tickers with unusual activity.
     Returns a deduplicated list of tickers worth analyzing.
     """
-    log.info("Scanning market-wide flow for candidates...")
+    log.info(f"Scanning market-wide flow for candidates...{f' (date={date})' if date else ''}")
 
-    data = uw_get("/api/option-trades/flow-alerts", {
+    params = {
         "min_premium": min_premium,
-        "size_greater_oi": True,
         "limit": limit,
-    })
+    }
+    if date:
+        params["newer_than"] = f"{date}T00:00:00"
+        params["older_than"] = f"{date}T23:59:59"
+        params["limit"] = max(limit, 200)
+    else:
+        params["size_greater_oi"] = True
+    data = uw_get("/api/option-trades/flow-alerts", params)
+    if not data:
+        log.warning(f"[SCAN] API returned empty response for {date or 'today'} — possible rate limit")
+        return []
     alerts = data.get("data", [])
+    if not alerts and date:
+        log.warning(f"[SCAN] Zero alerts for {date} — possible rate limit (or genuinely no flow)")
 
     # Count alerts per ticker, weighted by premium
     ticker_scores = {}
@@ -1712,6 +1816,354 @@ def print_report(result: StrategyResult):
     print(f"\n{'='*60}\n")
 
 # ---------------------------------------------------------------------------
+# Backtest Engine
+# ---------------------------------------------------------------------------
+
+def _get_spy_regime(spy_prices: dict, date: str) -> str:
+    """Determine market regime from SPY prices. Returns 'BULLISH', 'BEARISH', or 'NEUTRAL'.
+    Uses 20-day SMA: price above = BULLISH, below = BEARISH."""
+    sorted_dates = sorted(d for d in spy_prices if d <= date)
+    if len(sorted_dates) < 20:
+        return "NEUTRAL"
+    recent_20 = sorted_dates[-20:]
+    sma_20 = sum(spy_prices[d]["close"] for d in recent_20) / 20
+    current_close = spy_prices[sorted_dates[-1]]["close"]
+    if current_close > sma_20 * 1.01:
+        return "BULLISH"
+    elif current_close < sma_20 * 0.99:
+        return "BEARISH"
+    return "NEUTRAL"
+
+
+def get_current_regime() -> str:
+    """Fetch SPY OHLC and return current market regime for live/scan signals."""
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+        spy_prices = fetch_ohlc_prices("SPY", today)
+        return _get_spy_regime(spy_prices, today)
+    except Exception as e:
+        log.warning(f"[REGIME] Failed to get current regime: {e}")
+        return "NEUTRAL"
+
+
+def run_backtest(start_date: str, end_date: str, top_n: int = 5,
+                 delay: float = 1.0, min_conviction: str = "LOW") -> list:
+    trading_days = get_trading_days(start_date, end_date)
+    log.info(f"[BACKTEST] {len(trading_days)} trading days from {start_date} to {end_date}")
+    log.info(f"[BACKTEST] Settings: top_n={top_n} min_conviction={min_conviction} delay={delay}s")
+
+    spy_prices = fetch_ohlc_prices("SPY", end_date)
+    log.info(f"[BACKTEST] SPY OHLC loaded: {len(spy_prices)} days for regime filter")
+
+    conviction_order = ["NONE", "LOW", "MEDIUM", "HIGH", "VERY_HIGH"]
+    min_level = conviction_order.index(min_conviction)
+
+    trades: list = []
+    ohlc_cache: dict = {}
+    consecutive_empty = 0
+
+    for day_idx, day in enumerate(trading_days):
+        log.info(f"\n[BACKTEST] {'='*50}")
+        log.info(f"[BACKTEST] Day {day_idx+1}/{len(trading_days)}: {day}")
+        log.info(f"[BACKTEST] {'='*50}")
+
+        candidates = scan_flow_for_candidates(date=day)
+        if not candidates:
+            consecutive_empty += 1
+            if consecutive_empty >= 3:
+                log.warning(
+                    f"[BACKTEST] {day}: No candidates found ({consecutive_empty} consecutive empty days "
+                    f"— likely rate limited, sleeping 30s)"
+                )
+                time.sleep(30)
+            else:
+                log.info(f"[BACKTEST] {day}: No candidates found")
+            continue
+        consecutive_empty = 0
+
+        tickers_to_analyze = candidates[:top_n]
+        log.info(f"[BACKTEST] {day}: Analyzing {len(tickers_to_analyze)} tickers: {tickers_to_analyze}")
+
+        for ticker in tickers_to_analyze:
+            time.sleep(delay)
+
+            try:
+                result = analyze_ticker(ticker, date=day)
+            except Exception as e:
+                log.warning(f"[BACKTEST] {day} {ticker}: Analysis failed: {e}")
+                continue
+
+            r_level = conviction_order.index(result.conviction)
+            if r_level < min_level:
+                log.info(f"[BACKTEST] {day} {ticker}: {result.conviction} below {min_conviction}, skipping")
+                continue
+
+            if result.direction == Signal.NEUTRAL:
+                log.info(f"[BACKTEST] {day} {ticker}: NEUTRAL direction, skipping")
+                continue
+
+            regime = _get_spy_regime(spy_prices, day)
+            regime_conflict = (
+                (result.direction == Signal.BULLISH and regime == "BEARISH") or
+                (result.direction == Signal.BEARISH and regime == "BULLISH")
+            )
+            if regime_conflict:
+                log.info(
+                    f"[BACKTEST] {day} {ticker}: {result.direction.value} signal conflicts with "
+                    f"{regime} market regime — skipping"
+                )
+                continue
+
+            if regime == "NEUTRAL":
+                neutral_pass = (
+                    r_level >= conviction_order.index("MEDIUM") and
+                    50 <= result.composite_score < 60
+                )
+                if not neutral_pass:
+                    log.info(
+                        f"[BACKTEST] {day} {ticker}: NEUTRAL regime requires MEDIUM+ conviction "
+                        f"AND score 50-60 (got {result.conviction} / {result.composite_score:.1f}) — skipping"
+                    )
+                    continue
+
+            if ticker not in ohlc_cache:
+                ohlc_cache[ticker] = fetch_ohlc_prices(ticker, end_date)
+            prices = ohlc_cache[ticker]
+
+            next_day = None
+            for future_day in trading_days[day_idx + 1:]:
+                if future_day in prices:
+                    next_day = future_day
+                    break
+
+            if not next_day or next_day not in prices:
+                log.warning(f"[BACKTEST] {day} {ticker}: No next-day price data, skipping")
+                continue
+
+            entry_price = prices[next_day]["open"]
+            exit_price = prices[next_day]["close"]
+
+            if entry_price <= 0:
+                log.warning(f"[BACKTEST] {day} {ticker}: Invalid entry price, skipping")
+                continue
+
+            stop_pct = 10.0
+            if result.direction == Signal.BULLISH:
+                stop_price = entry_price * (1 - stop_pct / 100)
+                low = _float(prices[next_day].get("low"))
+                if low > 0 and low <= stop_price:
+                    exit_price = stop_price
+                    log.info(f"[BACKTEST] {day} {ticker}: STOP HIT at ${stop_price:.2f} (low=${low:.2f})")
+                return_pct = (exit_price - entry_price) / entry_price * 100
+            else:
+                stop_price = entry_price * (1 + stop_pct / 100)
+                high = _float(prices[next_day].get("high"))
+                if high > 0 and high >= stop_price:
+                    exit_price = stop_price
+                    log.info(f"[BACKTEST] {day} {ticker}: STOP HIT at ${stop_price:.2f} (high=${high:.2f})")
+                return_pct = (entry_price - exit_price) / entry_price * 100
+
+            trade = BacktestTrade(
+                ticker=ticker,
+                date=day,
+                direction=result.direction.value,
+                conviction=result.conviction,
+                composite_score=result.composite_score,
+                entry_price=entry_price,
+                exit_price=exit_price,
+                return_pct=return_pct,
+                win=return_pct > 0,
+                regime=regime,
+                layer_signals={
+                    "flow": result.flow.signal.value,
+                    "darkpool": result.darkpool.signal.value,
+                    "gex": result.gex.signal.value,
+                    "iv": result.iv.signal.value,
+                    "technicals": result.technicals.signal.value,
+                    "catalyst": result.catalyst.signal.value,
+                    "social": result.social.signal.value,
+                },
+                layer_scores={
+                    "flow": result.flow.score,
+                    "darkpool": result.darkpool.score,
+                    "gex": result.gex.score,
+                    "iv": result.iv.score,
+                    "technicals": result.technicals.score,
+                    "catalyst": result.catalyst.score,
+                    "social": result.social.score,
+                },
+            )
+            trades.append(trade)
+
+            log.info(
+                f"[BACKTEST] {day} {ticker}: {result.direction.value} {result.conviction} "
+                f"score={result.composite_score:.1f} | entry=${entry_price:.2f} exit=${exit_price:.2f} "
+                f"return={return_pct:+.2f}% {'WIN' if return_pct > 0 else 'LOSS'}"
+            )
+
+    return trades
+
+
+def print_backtest_results(trades: list):
+    if not trades:
+        print("\n  No trades generated during backtest period.")
+        return
+
+    print(f"\n{'='*76}")
+    print(f"  BACKTEST RESULTS — {trades[0].date} to {trades[-1].date}")
+    print(f"{'='*76}")
+
+    total = len(trades)
+    wins = [t for t in trades if t.win]
+    losses = [t for t in trades if not t.win]
+    win_rate = len(wins) / total * 100
+
+    returns = [t.return_pct for t in trades]
+    win_returns = [t.return_pct for t in wins]
+    loss_returns = [t.return_pct for t in losses]
+
+    avg_win = sum(win_returns) / len(win_returns) if win_returns else 0
+    avg_loss = sum(loss_returns) / len(loss_returns) if loss_returns else 0
+
+    gross_wins = sum(win_returns)
+    gross_losses = abs(sum(loss_returns))
+    profit_factor = gross_wins / gross_losses if gross_losses > 0 else 9999.0
+
+    cumulative = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    for r in returns:
+        cumulative += r
+        if cumulative > peak:
+            peak = cumulative
+        dd = peak - cumulative
+        if dd > max_dd:
+            max_dd = dd
+
+    if len(returns) > 1:
+        mean_ret = sum(returns) / len(returns)
+        variance = sum((r - mean_ret) ** 2 for r in returns) / (len(returns) - 1)
+        std_ret = variance ** 0.5
+        sharpe = (mean_ret / std_ret) * (252 ** 0.5) if std_ret > 0 else 0
+    else:
+        sharpe = 0
+
+    total_return = sum(returns)
+
+    print(f"\n  OVERVIEW")
+    print(f"  {'─'*62}")
+    print(f"  Total trades:     {total}")
+    print(f"  Wins / Losses:    {len(wins)} / {len(losses)}")
+    print(f"  Win rate:         {win_rate:.1f}%")
+    print(f"  Total return:     {total_return:+.2f}% (sum of individual trade returns)")
+    print(f"  Avg win:          {avg_win:+.2f}%")
+    print(f"  Avg loss:         {avg_loss:+.2f}%")
+    print(f"  Profit factor:    {profit_factor:.2f}")
+    print(f"  Max drawdown:     {max_dd:.2f}%")
+    print(f"  Sharpe ratio:     {sharpe:.2f} (annualized)")
+
+    # Per-conviction breakdown
+    print(f"\n  BY CONVICTION")
+    print(f"  {'─'*62}")
+    print(f"  {'Level':<12} {'Trades':>7} {'Win%':>7} {'AvgRet':>8} {'PF':>7}")
+    for level in ["LOW", "MEDIUM", "HIGH", "VERY_HIGH"]:
+        lt = [t for t in trades if t.conviction == level]
+        if not lt:
+            continue
+        lw = [t for t in lt if t.win]
+        lwr = len(lw) / len(lt) * 100
+        lavg = sum(t.return_pct for t in lt) / len(lt)
+        lgw = sum(t.return_pct for t in lw)
+        lgl = abs(sum(t.return_pct for t in lt if not t.win))
+        lpf = lgw / lgl if lgl > 0 else 9999.0
+        print(f"  {level:<12} {len(lt):>7} {lwr:>6.1f}% {lavg:>+7.2f}% {lpf:>7.2f}")
+
+    # Per-direction breakdown
+    print(f"\n  BY DIRECTION")
+    print(f"  {'─'*62}")
+    print(f"  {'Dir':<12} {'Trades':>7} {'Win%':>7} {'AvgRet':>8} {'PF':>7}")
+    for direction in ["BULLISH", "BEARISH"]:
+        dt = [t for t in trades if t.direction == direction]
+        if not dt:
+            continue
+        dw = [t for t in dt if t.win]
+        dwr = len(dw) / len(dt) * 100
+        davg = sum(t.return_pct for t in dt) / len(dt)
+        dgw = sum(t.return_pct for t in dw)
+        dgl = abs(sum(t.return_pct for t in dt if not t.win))
+        dpf = dgw / dgl if dgl > 0 else 9999.0
+        print(f"  {direction:<12} {len(dt):>7} {dwr:>6.1f}% {davg:>+7.2f}% {dpf:>7.2f}")
+
+    # Per-regime breakdown
+    print(f"\n  BY REGIME")
+    print(f"  {'─'*62}")
+    print(f"  {'Regime':<12} {'Trades':>7} {'Win%':>7} {'AvgRet':>8} {'PF':>7}")
+    for reg in ["BULLISH", "NEUTRAL", "BEARISH"]:
+        rt = [t for t in trades if t.regime == reg]
+        if not rt:
+            continue
+        rw = [t for t in rt if t.win]
+        rwr = len(rw) / len(rt) * 100
+        ravg = sum(t.return_pct for t in rt) / len(rt)
+        rgw = sum(t.return_pct for t in rw)
+        rgl = abs(sum(t.return_pct for t in rt if not t.win))
+        rpf = rgw / rgl if rgl > 0 else 9999.0
+        print(f"  {reg:<12} {len(rt):>7} {rwr:>6.1f}% {ravg:>+7.2f}% {rpf:>7.2f}")
+
+    # Per-layer accuracy
+    print(f"\n  LAYER ACCURACY (when layer signaled BULLISH/BEARISH, did the trade win?)")
+    print(f"  {'─'*62}")
+    print(f"  {'Layer':<12} {'Bull W/L':>10} {'Bull%':>7} {'Bear W/L':>10} {'Bear%':>7}")
+    for layer in ["flow", "darkpool", "gex", "iv", "technicals", "catalyst", "social"]:
+        bt = [t for t in trades if t.layer_signals.get(layer) == "BULLISH"]
+        brt = [t for t in trades if t.layer_signals.get(layer) == "BEARISH"]
+
+        bw = len([t for t in bt if t.win])
+        bs = f"{bw}/{len(bt)}" if bt else "—"
+        bp = f"{bw/len(bt)*100:.0f}%" if bt else "—"
+
+        brw = len([t for t in brt if t.win])
+        brs = f"{brw}/{len(brt)}" if brt else "—"
+        brp = f"{brw/len(brt)*100:.0f}%" if brt else "—"
+
+        print(f"  {layer:<12} {bs:>10} {bp:>7} {brs:>10} {brp:>7}")
+
+    # Score distribution
+    print(f"\n  SCORE DISTRIBUTION")
+    print(f"  {'─'*62}")
+    for lo, hi in [(30, 40), (40, 50), (50, 60), (60, 70), (70, 80), (80, 100)]:
+        st = [t for t in trades if lo <= t.composite_score < hi]
+        if not st:
+            continue
+        sw = len([t for t in st if t.win])
+        swr = sw / len(st) * 100
+        savg = sum(t.return_pct for t in st) / len(st)
+        print(f"  Score {lo}-{hi:<4}  {len(st):>4} trades  {swr:>5.1f}% win  avg={savg:>+.2f}%")
+
+    # Full trade log
+    print(f"\n  TRADE LOG")
+    print(f"  {'─'*92}")
+    print(f"  {'Date':<12} {'Ticker':<7} {'Dir':<8} {'Conv':<10} {'Regime':<8} {'Score':>6} {'Entry':>8} {'Exit':>8} {'Ret':>8}")
+    print(f"  {'─'*92}")
+    for t in trades:
+        marker = "+" if t.win else "-"
+        reg = t.regime[:4] if t.regime else "?"
+        print(f"  {t.date:<12} {t.ticker:<7} {t.direction:<8} {t.conviction:<10} {reg:<8} "
+              f"{t.composite_score:>5.1f} ${t.entry_price:>7.2f} ${t.exit_price:>7.2f} {t.return_pct:>+7.2f}% {marker}")
+
+    print(f"\n{'='*76}")
+
+    return {
+        "total_trades": total,
+        "win_rate": win_rate,
+        "profit_factor": profit_factor,
+        "sharpe": sharpe,
+        "max_drawdown": max_dd,
+        "total_return": total_return,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Telegram Alerts
 # ---------------------------------------------------------------------------
 
@@ -1828,6 +2280,7 @@ class LiveMonitor:
         self._news_cache: dict[str, list] = {}
         self._market_tide: dict = {}
         self._gex_cache: dict[str, dict] = {}
+        self._regime_cache: tuple = ("", "NEUTRAL")
 
     def _should_analyze(self, ticker: str, premium: float) -> bool:
         if ticker in ETF_BLACKLIST:
@@ -1852,6 +2305,11 @@ class LiveMonitor:
 
             r_level = self._conviction_order.index(result.conviction)
             min_level = self._conviction_order.index(self.min_conviction)
+
+            today = datetime.now().strftime("%Y-%m-%d")
+            if self._regime_cache[0] != today:
+                self._regime_cache = (today, get_current_regime())
+            persistence.save_signal(result, mode="live", regime=self._regime_cache[1])
 
             if self.send_telegram and r_level >= min_level:
                 send_telegram_alert(result)
@@ -2169,6 +2627,17 @@ def main():
     parser.add_argument("--telegram-min-conviction", type=str, default="MEDIUM",
                         choices=["NONE", "LOW", "MEDIUM", "HIGH", "VERY_HIGH"],
                         help="Minimum conviction to trigger Telegram alert (default: MEDIUM)")
+    parser.add_argument("--backtest", action="store_true",
+                        help="Run historical backtest over date range")
+    parser.add_argument("--start-date", type=str, help="Backtest start date (YYYY-MM-DD)")
+    parser.add_argument("--end-date", type=str, help="Backtest end date (YYYY-MM-DD)")
+    parser.add_argument("--top-n", type=int, default=5,
+                        help="Tickers to analyze per day in backtest (default: 5)")
+    parser.add_argument("--backtest-delay", type=float, default=1.0,
+                        help="Seconds between API calls in backtest (default: 1.0)")
+    parser.add_argument("--backtest-min-conviction", type=str, default="LOW",
+                        choices=["NONE", "LOW", "MEDIUM", "HIGH", "VERY_HIGH"],
+                        help="Min conviction to record a trade in backtest (default: LOW)")
     args = parser.parse_args()
 
     if args.telegram and (not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID):
@@ -2193,21 +2662,49 @@ def main():
             log.info("[LIVE] Shutdown complete")
         return
 
+    # Backtest mode
+    if args.backtest:
+        if not args.start_date or not args.end_date:
+            print("ERROR: --backtest requires --start-date and --end-date")
+            sys.exit(1)
+        trades = run_backtest(
+            start_date=args.start_date,
+            end_date=args.end_date,
+            top_n=args.top_n,
+            delay=args.backtest_delay,
+            min_conviction=args.backtest_min_conviction,
+        )
+        stats = print_backtest_results(trades)
+        if trades and stats:
+            run_id = persistence.save_backtest_run(
+                args.start_date, args.end_date, args.top_n,
+                args.backtest_min_conviction, args.backtest_delay, stats,
+            )
+            if run_id:
+                persistence.save_backtest_trades(trades, run_id)
+        if args.json and trades:
+            print(json.dumps([asdict(t) for t in trades], indent=2, default=str))
+        return
+
     results = []
+    regime = get_current_regime()
 
     if args.scan:
         candidates = scan_flow_for_candidates(min_premium=args.min_premium)
-        for ticker in candidates[:5]:  # analyze top 5
+        for ticker in candidates[:5]:
             result = analyze_ticker(ticker)
             results.append(result)
+            persistence.save_signal(result, mode="scan", regime=regime)
     elif args.watchlist:
         tickers = [t.strip().upper() for t in args.watchlist.split(",")]
         for ticker in tickers:
             result = analyze_ticker(ticker)
             results.append(result)
+            persistence.save_signal(result, mode="manual", regime=regime)
     elif args.ticker:
         result = analyze_ticker(args.ticker)
         results.append(result)
+        persistence.save_signal(result, mode="manual", regime=regime)
     else:
         parser.print_help()
         sys.exit(0)
