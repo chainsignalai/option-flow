@@ -246,7 +246,7 @@ def analyze_flow(ticker: str) -> FlowScore: # analyze_flow function name, takes 
 
     # Get flow alerts for ticker
     data = uw_get("/api/option-trades/flow-alerts", {
-        "ticker": ticker,
+        "ticker_symbol": ticker,
         "min_premium": 100_000,
         "size_greater_oi": True,
         "limit": 50,
@@ -272,9 +272,10 @@ def analyze_flow(ticker: str) -> FlowScore: # analyze_flow function name, takes 
         try:
             premium = _float(alert.get("total_premium"))
             option_type = _str(alert.get("type")).upper()      # CALL or PUT
-            tags = alert.get("tags") or []
-            is_ask_side = "ask_side" in tags
-            is_bid_side = "bid_side" in tags
+            ask_prem = _float(alert.get("total_ask_side_prem"))
+            bid_prem = _float(alert.get("total_bid_side_prem"))
+            is_ask_side = ask_prem > bid_prem
+            is_bid_side = bid_prem > ask_prem
             is_sweep = alert.get("has_sweep", False)
 
             # Filter OTM only (call strike > underlying, put strike < underlying)
@@ -554,7 +555,7 @@ def analyze_darkpool(ticker: str) -> DarkpoolScore:
 # Layer 3: Gamma Exposure (GEX)
 # ---------------------------------------------------------------------------
 
-def analyze_gex(ticker: str, current_price: float = None) -> GEXScore:
+def analyze_gex(ticker: str, current_price: float = None, prefetched_levels: list = None) -> GEXScore:
     """
     Identify key gamma levels:
         - Max gamma strike = price magnet (stocks pin here)
@@ -567,8 +568,11 @@ def analyze_gex(ticker: str, current_price: float = None) -> GEXScore:
     if current_price:
         log.info(f"[GEX] {ticker}: Current price context: ${current_price:.2f}")
 
-    data = uw_get(f"/api/stock/{ticker}/spot-exposures/strike")
-    levels = data.get("data", [])
+    if prefetched_levels is not None:
+        levels = prefetched_levels
+    else:
+        data = uw_get(f"/api/stock/{ticker}/spot-exposures/strike")
+        levels = data.get("data", [])
     if not levels:
         log.info(f"[GEX] {ticker}: ❌ No GEX data returned — skipping layer")
         return gs
@@ -738,20 +742,23 @@ def analyze_iv(ticker: str) -> IVScore:
 
     log.info(f"[IV] {ticker}: Received {len(iv_data)} IV data points")
 
-    # Get the most recent IV data point
-    latest = iv_data[-1] if iv_data else {}
-    ivs.iv_current = _float(latest.get("implied_volatility"))
-    ivs.iv_percentile = _float(latest.get("iv_percentile"), 50)
-    ivs.iv_rank = _float(latest.get("iv_rank"), 50)
+    # Use 30-day IV horizon (standard for options), fall back to last item
+    latest = None
+    for pt in iv_data:
+        if _int(pt.get("days")) == 30:
+            latest = pt
+            break
+    if latest is None:
+        latest = iv_data[-1] if iv_data else {}
 
-    log.info(f"[IV] {ticker}: Current IV = {ivs.iv_current:.1%}")
+    ivs.iv_current = _float(latest.get("volatility"))
+    ivs.iv_percentile = _float(latest.get("percentile")) * 100  # API returns 0-1, we use 0-100
+
+    log.info(f"[IV] {ticker}: Current IV = {ivs.iv_current:.1%} ({_int(latest.get('days'))}d horizon)")
     log.info(f"[IV] {ticker}: IV Percentile = {ivs.iv_percentile:.0f}/100 (where IV sits vs last 52 weeks)")
-    log.info(f"[IV] {ticker}: IV Rank = {ivs.iv_rank:.0f}/100")
 
-    # Score using BOTH IV percentile and IV rank for robustness
-    # IV percentile handles outlier spikes better, IV rank is more responsive
-    avg_iv = (ivs.iv_percentile + ivs.iv_rank) / 2
-    log.info(f"[IV] {ticker}: Combined IV metric = {avg_iv:.0f} (avg of percentile {ivs.iv_percentile:.0f} + rank {ivs.iv_rank:.0f})")
+    avg_iv = ivs.iv_percentile
+    log.info(f"[IV] {ticker}: IV metric = {avg_iv:.0f} (percentile {ivs.iv_percentile:.0f})")
 
     if avg_iv <= 30:
         ivs.signal = Signal.BULLISH
@@ -785,7 +792,7 @@ def analyze_iv(ticker: str) -> IVScore:
 
     log.info(
         f"[IV] {ticker}: ✅ FINAL — IV={ivs.iv_current:.1%} | "
-        f"Percentile={ivs.iv_percentile:.0f} | Rank={ivs.iv_rank:.0f} | "
+        f"Percentile={ivs.iv_percentile:.0f} | "
         f"Score={ivs.score:.1f}/100 | Signal={ivs.signal.value}"
     )
     return ivs
@@ -841,7 +848,7 @@ def analyze_technicals(ticker: str, current_price: float = None) -> TechnicalSco
     })
     rsi_points = rsi_data.get("data", [])
     if rsi_points:
-        ts.rsi_14 = _float(rsi_points[-1].get("value"), 50)
+        ts.rsi_14 = _float(rsi_points[-1].get("values", {}).get("RSI"), 50)
         if ts.rsi_14 < 30:
             log.info(f"[TECH] {ticker}: RSI(14) = {ts.rsi_14:.1f} — OVERSOLD (below 30, potential bounce)")
         elif ts.rsi_14 > 70:
@@ -861,10 +868,10 @@ def analyze_technicals(ticker: str, current_price: float = None) -> TechnicalSco
     })
     macd_points = macd_data.get("data", [])
     if macd_points:
-        latest_macd = macd_points[-1]
-        macd_val = _float(latest_macd.get("macd"))
-        signal_val = _float(latest_macd.get("signal"))
-        ts.macd_histogram = macd_val - signal_val
+        latest_macd = macd_points[-1].get("values", {})
+        macd_val = _float(latest_macd.get("MACD"))
+        signal_val = _float(latest_macd.get("MACD_Signal"))
+        ts.macd_histogram = _float(latest_macd.get("MACD_Hist"), macd_val - signal_val)
         if ts.macd_histogram > 0:
             log.info(
                 f"[TECH] {ticker}: MACD histogram = {ts.macd_histogram:+.4f} — POSITIVE MOMENTUM "
@@ -887,7 +894,7 @@ def analyze_technicals(ticker: str, current_price: float = None) -> TechnicalSco
     })
     sma20_points = sma20_data.get("data", [])
     if sma20_points:
-        ts.sma_20 = _float(sma20_points[-1].get("value"))
+        ts.sma_20 = _float(sma20_points[-1].get("values", {}).get("SMA"))
         log.info(f"[TECH] {ticker}: SMA(20) = ${ts.sma_20:.2f}")
     else:
         log.warning(f"[TECH] {ticker}: ⚠️ SMA(20) data unavailable")
@@ -901,7 +908,7 @@ def analyze_technicals(ticker: str, current_price: float = None) -> TechnicalSco
     })
     sma50_points = sma50_data.get("data", [])
     if sma50_points:
-        ts.sma_50 = _float(sma50_points[-1].get("value"))
+        ts.sma_50 = _float(sma50_points[-1].get("values", {}).get("SMA"))
         log.info(f"[TECH] {ticker}: SMA(50) = ${ts.sma_50:.2f}")
     else:
         log.warning(f"[TECH] {ticker}: ⚠️ SMA(50) data unavailable")
@@ -913,28 +920,14 @@ def analyze_technicals(ticker: str, current_price: float = None) -> TechnicalSco
     })
     vwap_points = vwap_data.get("data", [])
     if vwap_points:
-        ts.vwap = _float(vwap_points[-1].get("value"))
+        ts.vwap = _float(vwap_points[-1].get("values", {}).get("VWAP"))
         log.info(f"[TECH] {ticker}: VWAP = ${ts.vwap:.2f}")
     else:
         log.warning(f"[TECH] {ticker}: ⚠️ VWAP data unavailable")
 
-    # Relative Volume — confirms institutional participation behind moves
-    log.info(f"[TECH] {ticker}: Requesting volume data...")
-    vol_data = uw_get(f"/api/stock/{ticker}/volume")
-    vol_points = vol_data.get("data", [])
-    if vol_points and len(vol_points) >= 21:
-        today_vol = _float(vol_points[-1].get("volume"))
-        avg_vol = sum(_float(v.get("volume")) for v in vol_points[-21:-1]) / 20
-        if avg_vol > 0:
-            ts.relative_volume = today_vol / avg_vol
-            if ts.relative_volume >= 2.0:
-                log.info(f"[TECH] {ticker}: Relative Volume = {ts.relative_volume:.2f}x — VERY HIGH (institutional participation)")
-            elif ts.relative_volume >= 1.5:
-                log.info(f"[TECH] {ticker}: Relative Volume = {ts.relative_volume:.2f}x — ELEVATED (above average)")
-            else:
-                log.info(f"[TECH] {ticker}: Relative Volume = {ts.relative_volume:.2f}x — NORMAL")
-    else:
-        log.warning(f"[TECH] {ticker}: ⚠️ Volume data unavailable or insufficient")
+    # Relative Volume — UW API doesn't expose a stock volume endpoint;
+    # RVOL will be populated from live WebSocket data when available.
+    log.debug(f"[TECH] {ticker}: RVOL not available via REST API (live-only)")
 
     # Trend alignment
     if ts.sma_20 and ts.sma_50:
@@ -1074,7 +1067,7 @@ def analyze_catalyst(ticker: str, flow: FlowScore = None) -> CatalystScore:
         # Find nearest future earnings date
         nearest_date = None
         for e in earnings:
-            date_str = e.get("date", "")
+            date_str = e.get("report_date", "")
             if not date_str:
                 continue
             try:
@@ -1107,8 +1100,8 @@ def analyze_catalyst(ticker: str, flow: FlowScore = None) -> CatalystScore:
             cs.has_upcoming_catalyst = True
             cs.catalyst_type = "FDA"
             fda_found = True
-            fda_date = event.get("date", "unknown")
-            fda_drug = event.get("drug_name", event.get("description", "unknown"))
+            fda_date = event.get("start_date", event.get("target_date", "unknown"))
+            fda_drug = event.get("drug", event.get("description", "unknown"))
             log.info(
                 f"[CAT] {ticker}: 🧬 FDA CATALYST FOUND — "
                 f"Date={fda_date} | Drug/Event={fda_drug}"
@@ -1531,36 +1524,30 @@ def analyze_ticker(ticker: str) -> StrategyResult:
     log.info(f"\n[PIPELINE] {ticker}: ── Layer 2/7: DARK POOL ──")
     result.darkpool = analyze_darkpool(ticker)
 
-    # Layer 3: GEX (needs current price from technicals)
-    # We'll get price from SMA data later and re-score if needed
-
     # Layer 4: IV
     log.info(f"\n[PIPELINE] {ticker}: ── Layer 4/7: IMPLIED VOLATILITY ──")
     result.iv = analyze_iv(ticker)
 
-    # Fetch current stock price (needed by technicals and GEX)
+    # Layer 3: GEX — also extracts current price from spot-exposures data
+    log.info(f"\n[PIPELINE] {ticker}: ── Layer 3/7: GAMMA EXPOSURE (GEX) ──")
+    gex_raw = uw_get(f"/api/stock/{ticker}/spot-exposures/strike")
+    gex_levels = gex_raw.get("data", [])
+
     current_price = None
-    price_data = uw_get(f"/api/stock/{ticker}/quote")
-    quote = price_data.get("data", {})
-    if isinstance(quote, list):
-        quote = quote[-1] if quote else {}
-    for key in ("price", "last", "close"):
-        if quote.get(key):
-            current_price = _float(quote[key])
-            if current_price > 0:
-                log.info(f"[PIPELINE] {ticker}: Current price = ${current_price:.2f}")
-                break
+    if gex_levels:
+        current_price = _float(gex_levels[0].get("price"))
+        if current_price > 0:
+            log.info(f"[PIPELINE] {ticker}: Current price = ${current_price:.2f} (from GEX data)")
+        else:
             current_price = None
     if not current_price:
-        log.warning(f"[PIPELINE] {ticker}: ⚠️ Could not fetch price — VWAP scoring and GEX will be limited")
+        log.warning(f"[PIPELINE] {ticker}: ⚠️ Could not determine price — VWAP and GEX scoring limited")
+
+    result.gex = analyze_gex(ticker, current_price, prefetched_levels=gex_levels)
 
     # Layer 5: Technicals (needs current_price for VWAP comparison)
     log.info(f"\n[PIPELINE] {ticker}: ── Layer 5/7: TECHNICALS ──")
     result.technicals = analyze_technicals(ticker, current_price=current_price)
-
-    # Layer 3 revisited with price context
-    log.info(f"\n[PIPELINE] {ticker}: ── Layer 3/7: GAMMA EXPOSURE (GEX) ──")
-    result.gex = analyze_gex(ticker, current_price)
 
     # Layer 6: Catalyst
     log.info(f"\n[PIPELINE] {ticker}: ── Layer 6/7: CATALYST DETECTION ──")
@@ -1596,7 +1583,7 @@ def scan_flow_for_candidates(min_premium: int = 100_000, limit: int = 50) -> lis
     ticker_scores = {}
     for alert in alerts:
         try:
-            ticker = alert.get("ticker_symbol", alert.get("ticker", ""))
+            ticker = alert.get("ticker", "")
             premium = _float(alert.get("total_premium"))
             if ticker:
                 if ticker not in ticker_scores:
@@ -1664,8 +1651,10 @@ def print_report(result: StrategyResult):
           f"PutWall=${result.gex.put_wall_strike} "
           f"CallWall=${result.gex.call_wall_strike}")
     print(f"  4. IV         {result.iv.score:5.1f}  {direction_emoji.get(result.iv.signal, '')} "
-          f"Pctl={result.iv.iv_percentile} "
-          f"Current={result.iv.iv_current}")
+          f"Pctl={result.iv.iv_percentile:.0f} "
+          f"Current={result.iv.iv_current:.1%}" if result.iv.iv_current else
+          f"  4. IV         {result.iv.score:5.1f}  {direction_emoji.get(result.iv.signal, '')} "
+          f"Pctl={result.iv.iv_percentile} Current=N/A")
     print(f"  5. Technicals {result.technicals.score:5.1f}  {direction_emoji.get(result.technicals.signal, '')} "
           f"RSI={result.technicals.rsi_14} "
           f"MACD_h={result.technicals.macd_histogram} "
@@ -1747,7 +1736,7 @@ def format_telegram_message(result: StrategyResult) -> str:
         f"1. Flow       {result.flow.score:5.1f} {de(result.flow.signal, '')}  Bull={result.flow.bullish_sweeps} Bear={result.flow.bearish_sweeps}  RawPrem=${result.flow.total_premium:,.0f} WtPrem=${result.flow.total_premium_weighted:,.0f}",
         f"2. Darkpool   {result.darkpool.score:5.1f} {de(result.darkpool.signal, '')}  Lg prints={result.darkpool.large_prints}  Activity={result.darkpool.activity_level}",
         f"3. GEX        {result.gex.score:5.1f} {de(result.gex.signal, '')}  MaxGamma=${result.gex.max_gamma_strike}  Flip={result.gex.gamma_flip}",
-        f"4. IV         {result.iv.score:5.1f} {de(result.iv.signal, '')}  Pctl={result.iv.iv_percentile}  Current={result.iv.iv_current}",
+        f"4. IV         {result.iv.score:5.1f} {de(result.iv.signal, '')}  Pctl={result.iv.iv_percentile:.0f}  IV={result.iv.iv_current:.1%}" if result.iv.iv_current else f"4. IV         {result.iv.score:5.1f} {de(result.iv.signal, '')}  Pctl=N/A  IV=N/A",
         f"5. Technicals {result.technicals.score:5.1f} {de(result.technicals.signal, '')}  RSI={result.technicals.rsi_14}  MACD_h={result.technicals.macd_histogram}  RVOL={result.technicals.relative_volume or 'N/A'}",
         f"6. Catalyst   {result.catalyst.score:5.1f} {de(result.catalyst.signal, '')}  Earnings={result.catalyst.next_earnings_date} ({result.catalyst.days_to_earnings}d)",
         f"7. Social     {result.social.score:5.1f} {de(result.social.signal, '')}  Mentions={result.social.mentions_24h} ({result.social.mentions_change_pct:+.0f}%)  WSB#{result.social.wsb_rank or 'N/A'}",
@@ -1874,13 +1863,12 @@ class LiveMonitor:
             del self._last_analysis[ticker]
 
     async def _handle_flow_alert(self, payload: dict):
-        ticker = payload.get("ticker_symbol", payload.get("ticker", ""))
+        ticker = payload.get("ticker", "")
         premium = _float(payload.get("total_premium"))
 
         if not ticker or not self._should_analyze(ticker, premium):
             return
 
-        tags = payload.get("tags") or []
         is_sweep = payload.get("has_sweep", False)
         vol_oi_ratio = _float(payload.get("volume_oi_ratio"))
 
@@ -1890,7 +1878,9 @@ class LiveMonitor:
             return
 
         option_type = str(payload.get("type", "")).upper()
-        side_label = "ASK" if "ask_side" in tags else "BID" if "bid_side" in tags else "MID"
+        ask_prem = _float(payload.get("total_ask_side_prem"))
+        bid_prem = _float(payload.get("total_bid_side_prem"))
+        side_label = "ASK" if ask_prem > bid_prem else "BID" if bid_prem > ask_prem else "MID"
         expiry = payload.get("expiry", "?")
         log.info(
             f"[LIVE] 🚨 Qualifying flow: {ticker} | {option_type} {side_label} | "
@@ -1904,7 +1894,7 @@ class LiveMonitor:
         size = _float(payload.get("size"))
         price = _float(payload.get("price"))
         notional = size * price
-        ticker = payload.get("ticker_symbol", payload.get("ticker", ""))
+        ticker = payload.get("ticker", "")
         if ticker and notional >= 1_000_000 and ticker not in ETF_BLACKLIST:
             log.info(f"[LIVE] 🏦 Dark pool: {ticker} | ${notional:,.0f} | {size:,.0f} shares @ ${price:.2f}")
 
