@@ -1811,6 +1811,9 @@ class LiveMonitor:
         self._last_analysis: dict[str, datetime] = {}
         self._running = True
         self._conviction_order = ["NONE", "LOW", "MEDIUM", "HIGH", "VERY_HIGH"]
+        self._news_cache: dict[str, list] = {}
+        self._market_tide: dict = {}
+        self._gex_cache: dict[str, dict] = {}
 
     def _is_market_hours(self) -> bool:
         now_et = datetime.now(ET)
@@ -1838,6 +1841,7 @@ class LiveMonitor:
 
         try:
             result = analyze_ticker(ticker)
+            result = self._apply_live_enhancements(result, ticker)
             print_report(result)
 
             r_level = self._conviction_order.index(result.conviction)
@@ -1895,6 +1899,152 @@ class LiveMonitor:
         if ticker and notional >= 1_000_000 and ticker not in ETF_BLACKLIST:
             log.info(f"[LIVE] 🏦 Dark pool: {ticker} | ${notional:,.0f} | {volume:,.0f} shares @ ${price:.2f}")
 
+    def _handle_news(self, payload: dict):
+        tickers = payload.get("tickers") or []
+        headline = payload.get("headline", "")
+        sentiment = payload.get("sentiment", "neutral")
+        is_major = payload.get("is_major", False)
+        source = payload.get("source", "")
+
+        if is_major and tickers:
+            log.info(
+                f"[LIVE] 📰 MAJOR NEWS: \"{headline}\" | "
+                f"Tickers: {', '.join(tickers)} | Sentiment: {sentiment} | Source: {source}"
+            )
+
+        for t in tickers:
+            t = t.upper()
+            if t not in self._news_cache:
+                self._news_cache[t] = []
+            self._news_cache[t].append({
+                "headline": headline,
+                "sentiment": sentiment,
+                "is_major": is_major,
+                "source": source,
+                "created_at": payload.get("created_at", ""),
+            })
+            if len(self._news_cache[t]) > 20:
+                self._news_cache[t] = self._news_cache[t][-20:]
+
+    def _handle_market_tide(self, payload: dict):
+        call_p = _float(payload.get("net_call_premium"))
+        put_p = _float(payload.get("net_put_premium"))
+        self._market_tide = {
+            "net_call_premium": call_p,
+            "net_put_premium": put_p,
+            "net_volume": _int(payload.get("net_volume")),
+            "timestamp": payload.get("timestamp", ""),
+        }
+        total = abs(call_p) + abs(put_p)
+        if total > 0:
+            strength = (call_p - put_p) / total
+            regime = "BULLISH" if strength > 0.3 else "BEARISH" if strength < -0.3 else "NEUTRAL"
+            log.debug(
+                f"[LIVE] 🌊 Market Tide: Call=${call_p:,.0f} Put=${put_p:,.0f} "
+                f"Strength={strength:+.2f} → {regime}"
+            )
+
+    def _handle_gex(self, payload: dict):
+        ticker = payload.get("ticker", payload.get("symbol", ""))
+        if not ticker:
+            return
+        ticker = ticker.upper()
+        gamma = _float(
+            payload.get("gamma_per_one_percent_move_oi",
+                         payload.get("gamma_per_one_percent_move_dir"))
+        )
+        self._gex_cache[ticker] = {
+            "gamma_1pct": gamma,
+            "price": _float(payload.get("price")),
+            "cached_at": datetime.now(),
+        }
+        regime = "POSITIVE (dampening)" if gamma > 0 else "NEGATIVE (amplifying)"
+        log.debug(f"[LIVE] ⚡ GEX: {ticker} | γ/1%={gamma:,.0f} | {regime}")
+
+    def _apply_live_enhancements(self, result: StrategyResult, ticker: str) -> StrategyResult:
+        modified = False
+
+        news_items = list(self._news_cache.get(ticker, []))
+        major_news = [n for n in news_items if n.get("is_major")]
+        if major_news:
+            latest = major_news[-1]
+            log.info(
+                f"[LIVE+] {ticker}: 📰 Major news: \"{latest['headline']}\" "
+                f"(sentiment: {latest['sentiment']}, source: {latest['source']})"
+            )
+            if not result.catalyst.has_upcoming_catalyst:
+                result.catalyst.has_upcoming_catalyst = True
+                result.catalyst.catalyst_type = "NEWS"
+                result.catalyst.score = max(result.catalyst.score, 75)
+            elif result.catalyst.score < 90:
+                result.catalyst.score = min(result.catalyst.score + 15, 100)
+            log.info(f"[LIVE+] {ticker}: Catalyst score → {result.catalyst.score}")
+            modified = True
+
+        gex_data = self._gex_cache.get(ticker)
+        if gex_data:
+            age = (datetime.now() - gex_data["cached_at"]).total_seconds()
+            if age < 300:
+                gamma = gex_data["gamma_1pct"]
+                if gamma < 0 and result.gex.signal == Signal.BEARISH:
+                    result.gex.score = min(result.gex.score + 10, 100)
+                    log.info(f"[LIVE+] {ticker}: ⚡ Real-time GEX confirms negative gamma → +10 GEX → {result.gex.score}")
+                    modified = True
+                elif gamma > 0 and result.gex.signal == Signal.BULLISH:
+                    result.gex.score = min(result.gex.score + 10, 100)
+                    log.info(f"[LIVE+] {ticker}: ⚡ Real-time GEX confirms positive gamma → +10 GEX → {result.gex.score}")
+                    modified = True
+
+        if modified:
+            result.composite_score = (
+                result.flow.score * WEIGHTS["flow"] +
+                result.darkpool.score * WEIGHTS["darkpool"] +
+                result.gex.score * WEIGHTS["gex"] +
+                result.iv.score * WEIGHTS["iv"] +
+                result.technicals.score * WEIGHTS["technicals"] +
+                result.catalyst.score * WEIGHTS["catalyst"] +
+                result.social.score * WEIGHTS["social"]
+            )
+
+        tide = self._market_tide
+        if tide:
+            call_p = tide.get("net_call_premium", 0)
+            put_p = tide.get("net_put_premium", 0)
+            total = abs(call_p) + abs(put_p)
+            if total > 0:
+                strength = (call_p - put_p) / total
+                if strength > 0.3 and result.direction == Signal.BULLISH:
+                    result.composite_score = min(result.composite_score + 3, 100)
+                    log.info(f"[LIVE+] {ticker}: 🌊 Bullish tide aligns with direction → +3 composite")
+                    modified = True
+                elif strength < -0.3 and result.direction == Signal.BULLISH:
+                    result.composite_score = max(result.composite_score - 3, 0)
+                    log.info(f"[LIVE+] {ticker}: 🌊 Bearish tide conflicts with bullish direction → -3 composite")
+                    modified = True
+                elif strength < -0.3 and result.direction == Signal.BEARISH:
+                    result.composite_score = min(result.composite_score + 3, 100)
+                    log.info(f"[LIVE+] {ticker}: 🌊 Bearish tide aligns with direction → +3 composite")
+                    modified = True
+                elif strength > 0.3 and result.direction == Signal.BEARISH:
+                    result.composite_score = max(result.composite_score - 3, 0)
+                    log.info(f"[LIVE+] {ticker}: 🌊 Bullish tide conflicts with bearish direction → -3 composite")
+                    modified = True
+
+        if modified:
+            if result.composite_score >= 75 and result.layers_aligned >= 4:
+                result.conviction = "VERY_HIGH"
+            elif result.composite_score >= 60 and result.layers_aligned >= 3:
+                result.conviction = "HIGH"
+            elif result.composite_score >= 45 and result.layers_aligned >= 2:
+                result.conviction = "MEDIUM"
+            elif result.composite_score >= 30:
+                result.conviction = "LOW"
+            else:
+                result.conviction = "NONE"
+            log.info(f"[LIVE+] {ticker}: Enhanced composite={result.composite_score:.1f} conviction={result.conviction}")
+
+        return result
+
     async def run(self):
         try:
             import websockets
@@ -1921,7 +2071,10 @@ class LiveMonitor:
 
                     await ws.send(json.dumps({"channel": "flow-alerts", "msg_type": "join"}))
                     await ws.send(json.dumps({"channel": "off_lit_trades", "msg_type": "join"}))
-                    log.info("[LIVE] Subscribed to: flow-alerts, off_lit_trades")
+                    await ws.send(json.dumps({"channel": "news", "msg_type": "join"}))
+                    await ws.send(json.dumps({"channel": "market_tide", "msg_type": "join"}))
+                    await ws.send(json.dumps({"channel": "gex", "msg_type": "join"}))
+                    log.info("[LIVE] Subscribed to: flow-alerts, off_lit_trades, news, market_tide, gex")
 
                     if not self._is_market_hours():
                         now_et = datetime.now(ET)
@@ -1948,6 +2101,12 @@ class LiveMonitor:
                                 await self._handle_flow_alert(payload)
                             elif channel == "off_lit_trades":
                                 self._handle_darkpool_print(payload)
+                            elif channel == "news":
+                                self._handle_news(payload)
+                            elif channel == "market_tide":
+                                self._handle_market_tide(payload)
+                            elif channel.startswith("gex"):
+                                self._handle_gex(payload)
                         except Exception as e:
                             log.warning(f"[LIVE] Bad payload on {channel}: {e}")
                             continue
