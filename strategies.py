@@ -8,7 +8,6 @@ from datetime import datetime
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 from enum import Enum
-from zoneinfo import ZoneInfo
 import httpx
 from dotenv import load_dotenv
 
@@ -1811,8 +1810,6 @@ def send_telegram_alert(result: StrategyResult) -> bool:
 # Live WebSocket Monitor
 # ---------------------------------------------------------------------------
 
-ET = ZoneInfo("America/New_York")
-
 class LiveMonitor:
     """Persistent websocket monitor — triggers 7-layer analysis on qualifying flow."""
 
@@ -1828,14 +1825,6 @@ class LiveMonitor:
         self._news_cache: dict[str, list] = {}
         self._market_tide: dict = {}
         self._gex_cache: dict[str, dict] = {}
-
-    def _is_market_hours(self) -> bool:
-        now_et = datetime.now(ET)
-        if now_et.weekday() >= 5:
-            return False
-        market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
-        market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
-        return market_open <= now_et <= market_close
 
     def _should_analyze(self, ticker: str, premium: float) -> bool:
         if ticker in ETF_BLACKLIST:
@@ -1873,16 +1862,6 @@ class LiveMonitor:
     async def _handle_flow_alert(self, payload: dict):
         ticker = payload.get("ticker_symbol", payload.get("ticker", ""))
         premium = _float(payload.get("total_premium"))
-
-        if not self._is_market_hours():
-            if ticker and premium >= self.min_premium and ticker not in ETF_BLACKLIST:
-                side = str(payload.get("side", "")).upper()
-                option_type = str(payload.get("type", "")).upper()
-                log.info(
-                    f"[LIVE] 🌙 After-hours flow: {ticker} | {option_type} {side} | "
-                    f"${premium:,.0f} — not triggering analysis (market closed)"
-                )
-            return
 
         if not ticker or not self._should_analyze(ticker, premium):
             return
@@ -2110,10 +2089,6 @@ class LiveMonitor:
                     await ws.send(json.dumps({"channel": "market_tide", "msg_type": "join"}))
                     await ws.send(json.dumps({"channel": "gex", "msg_type": "join"}))
                     log.info("[LIVE] Subscribed to: flow-alerts, off_lit_trades, news, market_tide, gex")
-
-                    if not self._is_market_hours():
-                        now_et = datetime.now(ET)
-                        log.info(f"[LIVE] ⏸️  Market closed ({now_et.strftime('%A %H:%M ET')}) — listening but not triggering analysis")
 
                     reconnect_delay = 1
 
