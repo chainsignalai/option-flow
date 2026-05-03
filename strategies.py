@@ -171,6 +171,7 @@ class StrategyResult:
     direction: Signal = Signal.NEUTRAL                                 # overall direction — whichever side has more layers agreeing
     conviction: str = "NONE"                                           # human-readable confidence: NONE / LOW / MEDIUM / HIGH / VERY_HIGH
     layers_aligned: int = 0                                            # how many of the 4 directional layers agree (Flow, GEX, Technicals, Social)
+    live_enhancements: list = field(default_factory=list)               # live WebSocket enhancement details for notifications
 
 
 # ---------------------------------------------------------------------------
@@ -1667,6 +1668,13 @@ def print_report(result: StrategyResult):
           f"{'📈 TRENDING' if result.social.is_trending else ''}")
     print(f"  {'─'*56}")
 
+    if result.live_enhancements:
+        print(f"\n  LIVE SIGNALS:")
+        print(f"  {'─'*56}")
+        for enh in result.live_enhancements:
+            print(f"    {enh}")
+        print(f"  {'─'*56}")
+
     # Trade suggestion
     if result.conviction in ("HIGH", "VERY_HIGH"):
         if result.direction == Signal.BULLISH:
@@ -1731,6 +1739,12 @@ def format_telegram_message(result: StrategyResult) -> str:
         f"6. Catalyst   {result.catalyst.score:5.1f} {de(result.catalyst.signal, '')}  Earnings={result.catalyst.next_earnings_date} ({result.catalyst.days_to_earnings}d)",
         f"7. Social     {result.social.score:5.1f} {de(result.social.signal, '')}  Mentions={result.social.mentions_24h} ({result.social.mentions_change_pct:+.0f}%)  WSB#{result.social.wsb_rank or 'N/A'}",
     ]
+
+    if result.live_enhancements:
+        lines.append(f"\n{'─'*30}")
+        lines.append(f"<b>LIVE SIGNALS</b>")
+        for enh in result.live_enhancements:
+            lines.append(f"  {enh}")
 
     # Trade suggestion
     if result.conviction in ("HIGH", "VERY_HIGH"):
@@ -1979,6 +1993,10 @@ class LiveMonitor:
             elif result.catalyst.score < 90:
                 result.catalyst.score = min(result.catalyst.score + 15, 100)
             log.info(f"[LIVE+] {ticker}: Catalyst score → {result.catalyst.score}")
+            result.live_enhancements.append(
+                f"📰 NEWS: \"{latest['headline']}\" "
+                f"({latest['sentiment']}, {latest['source']}) → Catalyst={result.catalyst.score}"
+            )
             modified = True
 
         gex_data = self._gex_cache.get(ticker)
@@ -1989,10 +2007,16 @@ class LiveMonitor:
                 if gamma < 0 and result.gex.signal == Signal.BEARISH:
                     result.gex.score = min(result.gex.score + 10, 100)
                     log.info(f"[LIVE+] {ticker}: ⚡ Real-time GEX confirms negative gamma → +10 GEX → {result.gex.score}")
+                    result.live_enhancements.append(
+                        f"⚡ GEX: Real-time confirms negative gamma (γ/1%={gamma:,.0f}) → +10 GEX → {result.gex.score}"
+                    )
                     modified = True
                 elif gamma > 0 and result.gex.signal == Signal.BULLISH:
                     result.gex.score = min(result.gex.score + 10, 100)
                     log.info(f"[LIVE+] {ticker}: ⚡ Real-time GEX confirms positive gamma → +10 GEX → {result.gex.score}")
+                    result.live_enhancements.append(
+                        f"⚡ GEX: Real-time confirms positive gamma (γ/1%={gamma:,.0f}) → +10 GEX → {result.gex.score}"
+                    )
                     modified = True
 
         if modified:
@@ -2013,22 +2037,33 @@ class LiveMonitor:
             total = abs(call_p) + abs(put_p)
             if total > 0:
                 strength = (call_p - put_p) / total
+                tide_adj = None
                 if strength > 0.3 and result.direction == Signal.BULLISH:
                     result.composite_score = min(result.composite_score + 3, 100)
+                    tide_adj = ("Bullish", "aligns with", "+3")
                     log.info(f"[LIVE+] {ticker}: 🌊 Bullish tide aligns with direction → +3 composite")
                     modified = True
                 elif strength < -0.3 and result.direction == Signal.BULLISH:
                     result.composite_score = max(result.composite_score - 3, 0)
+                    tide_adj = ("Bearish", "conflicts with", "-3")
                     log.info(f"[LIVE+] {ticker}: 🌊 Bearish tide conflicts with bullish direction → -3 composite")
                     modified = True
                 elif strength < -0.3 and result.direction == Signal.BEARISH:
                     result.composite_score = min(result.composite_score + 3, 100)
+                    tide_adj = ("Bearish", "aligns with", "+3")
                     log.info(f"[LIVE+] {ticker}: 🌊 Bearish tide aligns with direction → +3 composite")
                     modified = True
                 elif strength > 0.3 and result.direction == Signal.BEARISH:
                     result.composite_score = max(result.composite_score - 3, 0)
+                    tide_adj = ("Bullish", "conflicts with", "-3")
                     log.info(f"[LIVE+] {ticker}: 🌊 Bullish tide conflicts with bearish direction → -3 composite")
                     modified = True
+                if tide_adj:
+                    regime, action, adj = tide_adj
+                    result.live_enhancements.append(
+                        f"🌊 TIDE: {regime} market (strength={strength:+.2f}) "
+                        f"{action} {result.direction.value} → {adj} composite"
+                    )
 
         if modified:
             if result.composite_score >= 75 and result.layers_aligned >= 4:
