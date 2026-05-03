@@ -246,10 +246,9 @@ def analyze_flow(ticker: str) -> FlowScore: # analyze_flow function name, takes 
 
     # Get flow alerts for ticker
     data = uw_get("/api/option-trades/flow-alerts", {
-        "ticker_symbol": ticker,
+        "ticker": ticker,
         "min_premium": 100_000,
         "size_greater_oi": True,
-        "is_otm": True,
         "limit": 50,
     })
     alerts = data.get("data", [])
@@ -273,17 +272,30 @@ def analyze_flow(ticker: str) -> FlowScore: # analyze_flow function name, takes 
         try:
             premium = _float(alert.get("total_premium"))
             option_type = _str(alert.get("type")).upper()      # CALL or PUT
-            side = _str(alert.get("side")).upper()              # ASK, BID, MID
-            trade_type = _str(alert.get("trade_type")).upper() # SWEEP, BLOCK, etc.
+            tags = alert.get("tags") or []
+            is_ask_side = "ask_side" in tags
+            is_bid_side = "bid_side" in tags
+            is_sweep = alert.get("has_sweep", False)
+
+            # Filter OTM only (call strike > underlying, put strike < underlying)
+            underlying = _float(alert.get("underlying_price"))
+            strike_val = _float(alert.get("strike"))
+            if underlying and strike_val:
+                is_otm = (
+                    (option_type == "CALL" and strike_val > underlying) or
+                    (option_type == "PUT" and strike_val < underlying)
+                )
+                if not is_otm:
+                    continue
 
             # Calculate DTE from expiry field
-            expiry_str = alert.get("expires", "")
+            expiry_str = alert.get("expiry", "")
             strike = alert.get("strike", "?")
             dte = None
             dte_bucket = "sweet"
             if expiry_str:
                 try:
-                    expiry_date = datetime.strptime(expiry_str, "%Y-%m-%d").date()
+                    expiry_date = datetime.strptime(expiry_str[:10], "%Y-%m-%d").date()
                     dte = (expiry_date - today).days
                     if dte < 0:
                         dte = 0
@@ -309,28 +321,31 @@ def analyze_flow(ticker: str) -> FlowScore: # analyze_flow function name, takes 
             fs.total_premium_weighted += weighted_premium
             fs.max_premium = max(fs.max_premium, premium)
 
-            if alert.get("size_greater_oi"):
+            vol_oi_ratio = _float(alert.get("volume_oi_ratio"))
+            if vol_oi_ratio > 1.0:
                 fs.volume_gt_oi_count += 1
 
             # Determine if bullish or bearish
             # Call at ask = bullish, Put at ask = bearish
             # Call at bid = bearish (selling calls), Put at bid = bullish (selling puts)
             is_bullish = (
-                (option_type == "CALL" and side in ("ASK", "A")) or
-                (option_type == "PUT" and side in ("BID", "B"))
+                (option_type == "CALL" and is_ask_side) or
+                (option_type == "PUT" and is_bid_side)
             )
             is_bearish = (
-                (option_type == "PUT" and side in ("ASK", "A")) or
-                (option_type == "CALL" and side in ("BID", "B"))
+                (option_type == "PUT" and is_ask_side) or
+                (option_type == "CALL" and is_bid_side)
             )
 
-            if trade_type in ("SWEEP", "BLOCK"):
+            if is_sweep:
                 if is_bullish:
                     fs.bullish_sweeps += 1
                 elif is_bearish:
                     fs.bearish_sweeps += 1
 
             # Log every significant trade individually
+            side_label = "ASK" if is_ask_side else "BID" if is_bid_side else "MID"
+            trade_label = "SWEEP" if is_sweep else "SINGLE"
             sentiment = "BULL" if is_bullish else "BEAR" if is_bearish else "NEUTRAL"
             expiry = expiry_str or "?"
             vol = alert.get("volume", "?")
@@ -339,25 +354,25 @@ def analyze_flow(ticker: str) -> FlowScore: # analyze_flow function name, takes 
 
             if premium >= 100_000:
                 log.info(
-                    f"[FLOW] {ticker}: 🔔 BIG PRINT #{i+1} — {trade_type} {option_type} "
+                    f"[FLOW] {ticker}: 🔔 BIG PRINT #{i+1} — {trade_label} {option_type} "
                     f"${premium:,.0f} (wt ${weighted_premium:,.0f}) | Strike={strike} Exp={expiry} DTE={dte_label} [{dte_bucket}] | "
-                    f"Side={side} → {sentiment} | Vol={vol} OI={oi}"
+                    f"Side={side_label} → {sentiment} | Vol={vol} OI={oi}"
                 )
                 fs.details.append({
                     "type": option_type,
-                    "trade_type": trade_type,
+                    "trade_type": trade_label,
                     "premium": premium,
                     "weighted_premium": weighted_premium,
                     "strike": strike,
                     "expiry": expiry,
                     "dte": dte,
                     "dte_bucket": dte_bucket,
-                    "side": side,
+                    "side": side_label,
                     "sentiment": sentiment,
                 })
             elif premium >= 50_000:
                 log.debug(
-                    f"[FLOW] {ticker}: Print #{i+1} — {trade_type} {option_type} "
+                    f"[FLOW] {ticker}: Print #{i+1} — {trade_label} {option_type} "
                     f"${premium:,.0f} (wt ${weighted_premium:,.0f}) | Strike={strike} DTE={dte_label} [{dte_bucket}] | {sentiment}"
                 )
         except Exception as e:
@@ -458,23 +473,23 @@ def analyze_darkpool(ticker: str) -> DarkpoolScore:
 
     for i, p in enumerate(prints):
         try:
-            volume = _float(p.get("volume"))
+            size = _float(p.get("size"))
             price = _float(p.get("price"))
-            notional = volume * price
+            notional = size * price
             ds.total_notional += notional
-            trade_date = p.get("date", p.get("tracking_timestamp", "?"))
+            trade_date = p.get("executed_at", p.get("trf_executed_at", "?"))
 
             if notional >= 1_000_000:
                 ds.large_prints += 1
                 log.info(
                     f"[DARK] {ticker}: 🐋 LARGE PRINT #{ds.large_prints} — "
-                    f"${notional:,.0f} notional | {volume:,.0f} shares @ ${price:.2f} | "
+                    f"${notional:,.0f} notional | {size:,.0f} shares @ ${price:.2f} | "
                     f"Date={trade_date}"
                 )
             elif notional >= 500_000:
                 log.debug(
                     f"[DARK] {ticker}: Medium print — "
-                    f"${notional:,.0f} notional | {volume:,.0f} shares @ ${price:.2f}"
+                    f"${notional:,.0f} notional | {size:,.0f} shares @ ${price:.2f}"
                 )
         except Exception as e:
             log.warning(f"[DARK] {ticker}: Skipping bad print #{i+1}: {e}")
@@ -1573,7 +1588,6 @@ def scan_flow_for_candidates(min_premium: int = 100_000, limit: int = 50) -> lis
     data = uw_get("/api/option-trades/flow-alerts", {
         "min_premium": min_premium,
         "size_greater_oi": True,
-        "is_otm": True,
         "limit": limit,
     })
     alerts = data.get("data", [])
@@ -1866,18 +1880,20 @@ class LiveMonitor:
         if not ticker or not self._should_analyze(ticker, premium):
             return
 
-        is_otm = payload.get("is_otm", False)
-        trade_type = str(payload.get("trade_type", "")).upper()
-        vol_gt_oi = payload.get("size_greater_oi", False)
+        tags = payload.get("tags") or []
+        is_sweep = payload.get("has_sweep", False)
+        vol_oi_ratio = _float(payload.get("volume_oi_ratio"))
 
-        if not (is_otm and trade_type in ("SWEEP", "BLOCK") and vol_gt_oi):
+        if not is_sweep:
+            return
+        if payload.get("volume_oi_ratio") is not None and vol_oi_ratio <= 1.0:
             return
 
         option_type = str(payload.get("type", "")).upper()
-        side = str(payload.get("side", "")).upper()
-        expiry = payload.get("expires", "?")
+        side_label = "ASK" if "ask_side" in tags else "BID" if "bid_side" in tags else "MID"
+        expiry = payload.get("expiry", "?")
         log.info(
-            f"[LIVE] 🚨 Qualifying flow: {ticker} | {option_type} {side} | "
+            f"[LIVE] 🚨 Qualifying flow: {ticker} | {option_type} {side_label} | "
             f"${premium:,.0f} | Exp={expiry} | Triggering analysis..."
         )
 
@@ -1885,12 +1901,12 @@ class LiveMonitor:
         asyncio.create_task(asyncio.to_thread(self._run_analysis, ticker))
 
     def _handle_darkpool_print(self, payload: dict):
-        volume = _float(payload.get("volume", payload.get("size")))
+        size = _float(payload.get("size"))
         price = _float(payload.get("price"))
-        notional = volume * price
+        notional = size * price
         ticker = payload.get("ticker_symbol", payload.get("ticker", ""))
         if ticker and notional >= 1_000_000 and ticker not in ETF_BLACKLIST:
-            log.info(f"[LIVE] 🏦 Dark pool: {ticker} | ${notional:,.0f} | {volume:,.0f} shares @ ${price:.2f}")
+            log.info(f"[LIVE] 🏦 Dark pool: {ticker} | ${notional:,.0f} | {size:,.0f} shares @ ${price:.2f}")
 
     def _handle_news(self, payload: dict):
         tickers = payload.get("tickers") or []
