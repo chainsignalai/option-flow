@@ -1759,11 +1759,13 @@ def compute_trade_plan(result: StrategyResult, regime: str = None) -> TradePlan:
     reward = abs(tp.target_price - price)
     tp.risk_reward = round(reward / risk, 1) if risk > 0 else 0
 
-    # --- Suggested Contract (follow smart money's largest directional print) ---
+    # --- Suggested Contract ---
     # Filter: correct option type, OTM only, 6-90 DTE, strike within reasonable range
+    # Among passing prints, pick closest to ATM (higher delta, more realistic TP)
     max_otm = min(max(tp.target_pct * 2, 8.0) / 100, 0.15)
     want_type = "CALL" if is_bull else "PUT"
-    best_flow = None
+    passing_prints = []
+    top_premium_flow = None
     for d in result.flow.details:
         d_dte = d.get('dte')
         if not d_dte or d_dte < 6 or d_dte > 90:
@@ -1783,18 +1785,26 @@ def compute_trade_plan(result: StrategyResult, regime: str = None) -> TradePlan:
         otm_pct = abs(strike - price) / price
         if otm_pct > max_otm:
             continue
-        if best_flow is None or d.get('premium', 0) > best_flow.get('premium', 0):
-            best_flow = d
+        passing_prints.append(d)
+        if top_premium_flow is None or d.get('premium', 0) > top_premium_flow.get('premium', 0):
+            top_premium_flow = d
+
+    best_flow = None
+    if passing_prints:
+        best_flow = min(passing_prints, key=lambda d: abs(_float(d.get('strike')) - price))
 
     if best_flow:
         tp.suggested_strike = _float(best_flow.get('strike'))
         tp.suggested_expiry = best_flow.get('expiry', '')
+        flow_strike = _float(top_premium_flow.get('strike')) if top_premium_flow else None
         prem_fmt = f"${best_flow.get('premium', 0):,.0f}"
         tp.strike_reason = (
-            f"matches top flow — {prem_fmt} "
+            f"closest ATM from {len(passing_prints)} qualifying prints — {prem_fmt} "
             f"{best_flow.get('type', '')} {best_flow.get('trade_type', '')} "
             f"at this strike/expiry"
         )
+        if flow_strike and flow_strike != tp.suggested_strike:
+            tp.strike_reason += f" (top flow was ${flow_strike:.0f})"
 
     if tp.suggested_strike and tp.suggested_strike > 0:
         otm_pct = abs(tp.suggested_strike - price) / price
