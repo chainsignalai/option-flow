@@ -1760,21 +1760,25 @@ def compute_trade_plan(result: StrategyResult, regime: str = None) -> TradePlan:
     tp.risk_reward = round(reward / risk, 1) if risk > 0 else 0
 
     # --- Suggested Contract (follow smart money's largest directional print) ---
-    # Filter: aligned direction, 6-90 DTE (practical hold window), strike within 15% of price
-    max_otm = max(tp.target_pct * 2, 8.0) / 100  # at least 2× target move but min 8%
+    # Filter: correct option type, OTM only, 6-90 DTE, strike within reasonable range
+    max_otm = min(max(tp.target_pct * 2, 8.0) / 100, 0.15)
+    want_type = "CALL" if is_bull else "PUT"
     best_flow = None
     for d in result.flow.details:
         d_dte = d.get('dte')
-        sentiment = d.get('sentiment', '')
         if not d_dte or d_dte < 6 or d_dte > 90:
             continue
-        if not ((is_bull and sentiment == 'BULL') or (not is_bull and sentiment == 'BEAR')):
+        if d.get('type', '').upper() != want_type:
             continue
         strike = _float(d.get('strike'))
-        if strike and strike > 0:
-            moneyness = abs(strike - price) / price
-            if moneyness > max_otm:
-                continue
+        if not strike or strike <= 0:
+            continue
+        is_otm = (want_type == "CALL" and strike > price) or (want_type == "PUT" and strike < price)
+        if not is_otm:
+            continue
+        otm_pct = abs(strike - price) / price
+        if otm_pct > max_otm:
+            continue
         if best_flow is None or d.get('premium', 0) > best_flow.get('premium', 0):
             best_flow = d
 
@@ -1789,17 +1793,15 @@ def compute_trade_plan(result: StrategyResult, regime: str = None) -> TradePlan:
         )
 
     if tp.suggested_strike and tp.suggested_strike > 0:
-        moneyness = abs(tp.suggested_strike - price) / price
-        if moneyness <= 0.02:
+        otm_pct = abs(tp.suggested_strike - price) / price
+        if otm_pct <= 0.02:
             tp.suggested_delta = 0.50
-        elif moneyness <= 0.05:
+        elif otm_pct <= 0.05:
             tp.suggested_delta = 0.35
-        elif moneyness <= 0.10:
+        elif otm_pct <= 0.10:
             tp.suggested_delta = 0.25
-        elif moneyness <= 0.15:
-            tp.suggested_delta = 0.15
         else:
-            tp.suggested_delta = 0.10
+            tp.suggested_delta = 0.15
     else:
         tp.suggested_delta = 0.30
 
