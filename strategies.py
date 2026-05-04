@@ -2901,6 +2901,23 @@ class LiveMonitor:
         log.info(f"[LIVE] ETF filter: {len(ETF_BLACKLIST)} tickers excluded")
         log.info(f"[LIVE] {'='*50}")
 
+        if self.send_telegram and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+            try:
+                from paper_trader import get_open_positions
+                open_pos = get_open_positions() if self.paper_trade else []
+                pos_line = f"Open positions: {len(open_pos)}" if self.paper_trade else "Paper: OFF"
+                httpx.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                    json={"chat_id": TELEGRAM_CHAT_ID, "text":
+                        f"🟢 ChainSignal started\n"
+                        f"Paper: {'ON' if self.paper_trade else 'OFF'} | {pos_line}\n"
+                        f"Telegram: ON | Cooldown: {self.cooldown_minutes}min",
+                        "disable_web_page_preview": True},
+                    timeout=10,
+                )
+            except Exception as e:
+                log.error(f"[LIVE] Startup Telegram ping failed: {e}")
+
         if self.paper_trade:
             asyncio.ensure_future(self._paper_position_loop())
 
