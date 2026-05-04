@@ -1776,6 +1776,10 @@ def compute_trade_plan(result: StrategyResult, regime: str = None) -> TradePlan:
         is_otm = (want_type == "CALL" and strike > price) or (want_type == "PUT" and strike < price)
         if not is_otm:
             continue
+        hits_target = (want_type == "CALL" and strike <= tp.target_price) or \
+                      (want_type == "PUT" and strike >= tp.target_price)
+        if not hits_target:
+            continue
         otm_pct = abs(strike - price) / price
         if otm_pct > max_otm:
             continue
