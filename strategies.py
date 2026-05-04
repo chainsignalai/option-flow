@@ -2622,6 +2622,7 @@ class LiveMonitor:
 
             result = analyze_ticker(ticker, regime=self._regime_cache[1])
             result = self._apply_live_enhancements(result, ticker)
+            result.trade_plan = compute_trade_plan(result, regime=self._regime_cache[1])
             print_report(result)
 
             r_level = self._conviction_order.index(result.conviction)
