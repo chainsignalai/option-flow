@@ -28,7 +28,7 @@ def _get_client():
     return _client
 
 
-def save_signal(result, mode: str = "live", regime: str = None):
+def save_signal(result, mode: str = "live", regime: str = None, flow_contradicts: bool = False):
     """Persist a StrategyResult to the signals table."""
     client = _get_client()
     if not client:
@@ -57,6 +57,7 @@ def save_signal(result, mode: str = "live", regime: str = None):
             "social_signal": result.social.signal.value,
             "social_score": result.social.score,
             "live_enhancements": result.live_enhancements or [],
+            "flow_contradicts": flow_contradicts,
             "raw_result": _serialize_result(result),
         }
         resp = client.table("signals").insert(row).execute()

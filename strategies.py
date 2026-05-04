@@ -82,6 +82,8 @@ class FlowScore:
     max_premium: float = 0.0                       # biggest single order size in dollars
     total_premium: float = 0.0                     # raw total money spent across all alerts
     total_premium_weighted: float = 0.0            # DTE-weighted total premium (used for scoring)
+    bullish_premium: float = 0.0                   # DTE-weighted premium on bullish prints
+    bearish_premium: float = 0.0                   # DTE-weighted premium on bearish prints
     volume_gt_oi_count: int = 0                    # how many had volume > open interest (new positions being opened, not closing)
     signal: Signal = Signal.NEUTRAL                # the final verdict — BULLISH, BEARISH, or NEUTRAL
     score: float = 0.0                             # numeric confidence score (0-100)
@@ -157,6 +159,42 @@ class SocialScore:
 
 
 @dataclass
+class TradePlan:
+    """Trade management — IV-derived targets, trailing stop, theta kill switch."""
+    entry_price: Optional[float] = None
+    # Underlying stop/target
+    stop_price: Optional[float] = None
+    stop_pct: Optional[float] = None
+    stop_reason: str = ""
+    target_price: Optional[float] = None
+    target_pct: Optional[float] = None
+    target_reason: str = ""
+    risk_reward: Optional[float] = None
+    # IV expected move breakdown
+    expected_move_pct: Optional[float] = None
+    conviction_mult: float = 1.0
+    regime_mult: float = 1.0
+    catalyst_mult: float = 1.0
+    # Suggested contract
+    suggested_strike: Optional[float] = None
+    suggested_expiry: str = ""
+    suggested_delta: float = 0.30
+    option_leverage: float = 3.3
+    strike_reason: str = ""
+    # Option premium management (dynamic)
+    premium_target_pct: Optional[float] = None
+    premium_stop_pct: float = -40.0
+    trail_activate_pct: Optional[float] = None
+    trail_stop_pct: float = 20.0
+    # Theta decay management
+    max_hold_days: int = 10
+    theta_kill_days: int = 5
+    theta_kill_move_pct: float = 10.0
+    # DTE guidance
+    suggested_dte: str = ""
+
+
+@dataclass
 class StrategyResult:
     """Composite result across all 7 layers — the final output."""
     ticker: str = ""                                                   # stock ticker symbol (e.g. "NVDA")
@@ -173,6 +211,7 @@ class StrategyResult:
     conviction: str = "NONE"                                           # human-readable confidence: NONE / LOW / MEDIUM / HIGH / VERY_HIGH
     layers_aligned: int = 0                                            # how many of the 4 directional layers agree (Flow, GEX, Technicals, Social)
     live_enhancements: list = field(default_factory=list)               # live WebSocket enhancement details for notifications
+    trade_plan: Optional[TradePlan] = None                             # entry/exit/theta management
 
 
 @dataclass
@@ -418,6 +457,11 @@ def analyze_flow(ticker: str, date: str = None) -> FlowScore: # analyze_flow fun
                 (option_type == "CALL" and is_bid_side)
             )
 
+            if is_bullish:
+                fs.bullish_premium += weighted_premium
+            elif is_bearish:
+                fs.bearish_premium += weighted_premium
+
             if is_sweep:
                 if is_bullish:
                     fs.bullish_sweeps += 1
@@ -465,37 +509,51 @@ def analyze_flow(ticker: str, date: str = None) -> FlowScore: # analyze_flow fun
 
     fs.total_alerts = len(alerts) - skipped_0dte_index
 
-    # Score: weighted by premium size, sweep count, and directional bias
+    # Direction: premium-weighted (DTE-adjusted) instead of sweep-count
     total_directional = fs.bullish_sweeps + fs.bearish_sweeps
+    total_directional_premium = fs.bullish_premium + fs.bearish_premium
     log.info(
-        f"[FLOW] {ticker}: Directional sweeps/blocks: "
-        f"Bull={fs.bullish_sweeps} vs Bear={fs.bearish_sweeps} "
+        f"[FLOW] {ticker}: Directional sweeps: "
+        f"Bull={fs.bullish_sweeps} Bear={fs.bearish_sweeps} "
         f"(total={total_directional})"
+    )
+    log.info(
+        f"[FLOW] {ticker}: Directional premium (DTE-wtd): "
+        f"Bull=${fs.bullish_premium:,.0f} Bear=${fs.bearish_premium:,.0f}"
     )
     log.info(
         f"[FLOW] {ticker}: Vol>OI count={fs.volume_gt_oi_count} "
         f"(new positions being opened)"
     )
 
-    if total_directional > 0:
-        bull_ratio = fs.bullish_sweeps / total_directional
-        log.info(f"[FLOW] {ticker}: Bull ratio = {bull_ratio:.1%}")
+    if total_directional_premium > 0:
+        bull_ratio = fs.bullish_premium / total_directional_premium
+        log.info(f"[FLOW] {ticker}: Bull ratio (premium-wtd) = {bull_ratio:.1%}")
         if bull_ratio > 0.65:
             fs.signal = Signal.BULLISH
-            log.info(f"[FLOW] {ticker}: → BULLISH (bull ratio {bull_ratio:.1%} > 65% threshold)")
+            log.info(f"[FLOW] {ticker}: → BULLISH (premium-wtd {bull_ratio:.1%} > 65%)")
         elif bull_ratio < 0.35:
             fs.signal = Signal.BEARISH
-            log.info(f"[FLOW] {ticker}: → BEARISH (bull ratio {bull_ratio:.1%} < 35% threshold)")
+            log.info(f"[FLOW] {ticker}: → BEARISH (premium-wtd {bull_ratio:.1%} < 35%)")
         else:
             fs.signal = Signal.NEUTRAL
-            log.info(f"[FLOW] {ticker}: → NEUTRAL (bull ratio {bull_ratio:.1%} between 35-65%)")
+            log.info(f"[FLOW] {ticker}: → NEUTRAL (premium-wtd {bull_ratio:.1%} between 35-65%)")
+    elif total_directional > 0:
+        bull_ratio = fs.bullish_sweeps / total_directional
+        log.info(f"[FLOW] {ticker}: Bull ratio (sweep fallback) = {bull_ratio:.1%}")
+        if bull_ratio > 0.65:
+            fs.signal = Signal.BULLISH
+        elif bull_ratio < 0.35:
+            fs.signal = Signal.BEARISH
+        else:
+            fs.signal = Signal.NEUTRAL
     else:
         bull_ratio = 0.5
 
     # Score components (0-100) — uses DTE-weighted premium for scoring
     premium_score = min(fs.total_premium_weighted / 5_000_000 * 100, 100)  # $5M+ = max
     sweep_score = min(total_directional / 10 * 100, 100)           # 10+ sweeps = max
-    conviction_score = abs(bull_ratio - 0.5) * 200 if total_directional > 0 else 0
+    conviction_score = abs(bull_ratio - 0.5) * 200 if total_directional_premium > 0 else 0
     fs.score = (premium_score * 0.4 + sweep_score * 0.3 + conviction_score * 0.3)
 
     log.info(
@@ -507,6 +565,7 @@ def analyze_flow(ticker: str, date: str = None) -> FlowScore: # analyze_flow fun
     log.info(
         f"[FLOW] {ticker}: ✅ FINAL — {fs.total_alerts} alerts | "
         f"Bull={fs.bullish_sweeps} Bear={fs.bearish_sweeps} | "
+        f"BullPrem=${fs.bullish_premium:,.0f} BearPrem=${fs.bearish_premium:,.0f} | "
         f"MaxPrem=${fs.max_premium:,.0f} RawPrem=${fs.total_premium:,.0f} WtPrem=${fs.total_premium_weighted:,.0f} | "
         f"Score={fs.score:.1f}/100 | Signal={fs.signal.value}"
     )
@@ -1590,11 +1649,198 @@ def compute_composite(result: StrategyResult) -> StrategyResult:
 
     return result
 
+
+def compute_trade_plan(result: StrategyResult, regime: str = None) -> TradePlan:
+    """Compute IV-derived trade targets with conviction/regime/catalyst multipliers."""
+    tp = TradePlan()
+    price = result.technicals.current_price
+    if not price or price <= 0 or result.direction == Signal.NEUTRAL:
+        return tp
+
+    tp.entry_price = round(price, 2)
+    is_bull = result.direction == Signal.BULLISH
+    if regime is None:
+        regime = "NEUTRAL"
+
+    # --- Theta / Hold Period ---
+    earnings_dte = result.catalyst.days_to_earnings
+    if earnings_dte is not None and earnings_dte <= 7:
+        tp.max_hold_days = max(earnings_dte - 1, 1)
+        tp.theta_kill_days = min(2, tp.max_hold_days)
+    elif earnings_dte is not None and earnings_dte <= 14:
+        tp.max_hold_days = max(earnings_dte - 2, 3)
+        tp.theta_kill_days = min(4, tp.max_hold_days)
+    else:
+        tp.max_hold_days = 10
+        tp.theta_kill_days = 5
+    tp.theta_kill_move_pct = 10.0
+
+    # --- Step 1: IV Expected Move ---
+    iv = result.iv.iv_current if result.iv.iv_current and result.iv.iv_current > 0 else 0.30
+    daily_move_pct = iv * (1 / 252) ** 0.5 * 100
+    tp.expected_move_pct = round(daily_move_pct * tp.max_hold_days ** 0.5, 1)
+
+    # --- Step 2: Multipliers ---
+    conv = result.conviction
+    if conv == "VERY_HIGH":
+        tp.conviction_mult = 2.0
+    elif conv == "HIGH":
+        tp.conviction_mult = 1.5
+    elif conv == "MEDIUM":
+        tp.conviction_mult = 1.0
+    else:
+        tp.conviction_mult = 0.75
+
+    regime_aligned = (is_bull and regime == "BULLISH") or (not is_bull and regime == "BEARISH")
+    regime_conflict = (is_bull and regime == "BEARISH") or (not is_bull and regime == "BULLISH")
+    if regime_aligned:
+        tp.regime_mult = 1.2
+    elif regime_conflict:
+        tp.regime_mult = 0.8
+    else:
+        tp.regime_mult = 1.0
+
+    if earnings_dte is not None and earnings_dte <= 7:
+        tp.catalyst_mult = 1.3
+    elif earnings_dte is not None and earnings_dte <= 14:
+        tp.catalyst_mult = 1.1
+    else:
+        tp.catalyst_mult = 1.0
+
+    # --- Step 3: Underlying Target ---
+    tp.target_pct = round(
+        tp.expected_move_pct * tp.conviction_mult * tp.regime_mult * tp.catalyst_mult, 1
+    )
+    if is_bull:
+        tp.target_price = round(price * (1 + tp.target_pct / 100), 2)
+    else:
+        tp.target_price = round(price * (1 - tp.target_pct / 100), 2)
+
+    parts = [f"{tp.expected_move_pct}% IV×√{tp.max_hold_days}d"]
+    if tp.conviction_mult != 1.0:
+        parts.append(f"×{tp.conviction_mult} {conv}")
+    if tp.regime_mult != 1.0:
+        parts.append(f"×{tp.regime_mult} {regime}")
+    if tp.catalyst_mult != 1.0:
+        parts.append(f"×{tp.catalyst_mult} catalyst")
+    tp.target_reason = " ".join(parts)
+
+    # --- Stop Loss (GEX levels if 2-10% from price, else 5% default) ---
+    stop_set = False
+    if is_bull:
+        candidates = []
+        if result.gex.put_wall_strike:
+            dist = (price - result.gex.put_wall_strike) / price
+            if 0.02 <= dist <= 0.10:
+                candidates.append((result.gex.put_wall_strike, "put wall support"))
+        if result.gex.gamma_flip and result.gex.gamma_flip < price:
+            dist = (price - result.gex.gamma_flip) / price
+            if 0.02 <= dist <= 0.10:
+                candidates.append((result.gex.gamma_flip, "gamma flip"))
+        if candidates:
+            tp.stop_price = round(max(c[0] for c in candidates), 2)
+            tp.stop_reason = next(c[1] for c in candidates if round(c[0], 2) == tp.stop_price)
+            stop_set = True
+    else:
+        if result.gex.call_wall_strike and result.gex.call_wall_strike > price:
+            dist = (result.gex.call_wall_strike - price) / price
+            if 0.02 <= dist <= 0.10:
+                tp.stop_price = round(result.gex.call_wall_strike, 2)
+                tp.stop_reason = "call wall resistance"
+                stop_set = True
+
+    if not stop_set:
+        tp.stop_price = round(price * (0.95 if is_bull else 1.05), 2)
+        tp.stop_reason = "5% default"
+
+    tp.stop_pct = round(abs(tp.stop_price - price) / price * 100, 1)
+
+    risk = abs(price - tp.stop_price)
+    reward = abs(tp.target_price - price)
+    tp.risk_reward = round(reward / risk, 1) if risk > 0 else 0
+
+    # --- Suggested Contract (follow smart money's largest directional print) ---
+    # Filter: aligned direction, 6-90 DTE (practical hold window), strike within 15% of price
+    max_otm = max(tp.target_pct * 2, 8.0) / 100  # at least 2× target move but min 8%
+    best_flow = None
+    for d in result.flow.details:
+        d_dte = d.get('dte')
+        sentiment = d.get('sentiment', '')
+        if not d_dte or d_dte < 6 or d_dte > 90:
+            continue
+        if not ((is_bull and sentiment == 'BULL') or (not is_bull and sentiment == 'BEAR')):
+            continue
+        strike = _float(d.get('strike'))
+        if strike and strike > 0:
+            moneyness = abs(strike - price) / price
+            if moneyness > max_otm:
+                continue
+        if best_flow is None or d.get('premium', 0) > best_flow.get('premium', 0):
+            best_flow = d
+
+    if best_flow:
+        tp.suggested_strike = _float(best_flow.get('strike'))
+        tp.suggested_expiry = best_flow.get('expiry', '')
+        prem_fmt = f"${best_flow.get('premium', 0):,.0f}"
+        tp.strike_reason = (
+            f"matches top flow — {prem_fmt} "
+            f"{best_flow.get('type', '')} {best_flow.get('trade_type', '')} "
+            f"at this strike/expiry"
+        )
+
+    if tp.suggested_strike and tp.suggested_strike > 0:
+        moneyness = abs(tp.suggested_strike - price) / price
+        if moneyness <= 0.02:
+            tp.suggested_delta = 0.50
+        elif moneyness <= 0.05:
+            tp.suggested_delta = 0.35
+        elif moneyness <= 0.10:
+            tp.suggested_delta = 0.25
+        elif moneyness <= 0.15:
+            tp.suggested_delta = 0.15
+        else:
+            tp.suggested_delta = 0.10
+    else:
+        tp.suggested_delta = 0.30
+
+    tp.option_leverage = round(1 / tp.suggested_delta, 1) if tp.suggested_delta > 0 else 3.3
+
+    # --- Step 4: Option Premium Target (underlying move × leverage) ---
+    tp.premium_target_pct = round(tp.target_pct * tp.option_leverage, 0)
+    tp.premium_target_pct = max(20, min(tp.premium_target_pct, 200))
+    tp.premium_stop_pct = -40.0
+    tp.trail_activate_pct = round(tp.premium_target_pct * 0.6, 0)
+    tp.trail_stop_pct = 20.0
+
+    # --- DTE Guidance ---
+    flow_dtes = [d['dte'] for d in result.flow.details
+                 if d.get('dte') and 6 <= d['dte'] <= 180]
+    if flow_dtes:
+        median_dte = sorted(flow_dtes)[len(flow_dtes) // 2]
+        min_dte = max(median_dte, 21)
+        tp.suggested_dte = f"{min_dte}-{min_dte + 21} DTE"
+    elif earnings_dte is not None and earnings_dte <= 30:
+        tp.suggested_dte = f"{earnings_dte + 7}-{earnings_dte + 21} DTE"
+    else:
+        tp.suggested_dte = "21-45 DTE"
+
+    log.info(
+        f"[TRADE] {result.ticker}: Entry=${tp.entry_price} | "
+        f"Stop=${tp.stop_price} (-{tp.stop_pct}%, {tp.stop_reason}) | "
+        f"Target=${tp.target_price} (+{tp.target_pct}%) | "
+        f"R/R={tp.risk_reward}:1 | "
+        f"IV move={tp.expected_move_pct}% × conv={tp.conviction_mult} × regime={tp.regime_mult} × cat={tp.catalyst_mult} | "
+        f"Delta≈{tp.suggested_delta} → leverage={tp.option_leverage}x → premium TP=+{tp.premium_target_pct:.0f}% | "
+        f"Max hold={tp.max_hold_days}d | {tp.suggested_dte}"
+    )
+    return tp
+
+
 # ---------------------------------------------------------------------------
 # Main analysis pipeline
 # ---------------------------------------------------------------------------
 
-def analyze_ticker(ticker: str, date: str = None) -> StrategyResult:
+def analyze_ticker(ticker: str, date: str = None, regime: str = None) -> StrategyResult:
     """Run all 7 layers of analysis on a single ticker. Pass date='YYYY-MM-DD' for backtest mode."""
     ticker = ticker.upper()
     ts_label = date or datetime.now().isoformat()
@@ -1653,6 +1899,10 @@ def analyze_ticker(ticker: str, date: str = None) -> StrategyResult:
     # Composite
     log.info(f"\n[PIPELINE] {ticker}: ── COMPUTING COMPOSITE SCORE ──")
     result = compute_composite(result)
+
+    # Trade plan
+    log.info(f"\n[PIPELINE] {ticker}: ── TRADE PLAN ──")
+    result.trade_plan = compute_trade_plan(result, regime=regime)
 
     log.info(f"[PIPELINE] {ticker}: ✅ Analysis complete — {result.conviction} conviction {result.direction.value}")
 
@@ -1745,7 +1995,7 @@ def print_report(result: StrategyResult):
     print(f"  {'─'*56}")
     print(f"  1. Flow      {result.flow.score:5.1f}  {direction_emoji.get(result.flow.signal, '')} "
           f"Bull={result.flow.bullish_sweeps} Bear={result.flow.bearish_sweeps} "
-          f"RawPrem=${result.flow.total_premium:,.0f} WtPrem=${result.flow.total_premium_weighted:,.0f}")
+          f"BullPrem=${result.flow.bullish_premium:,.0f} BearPrem=${result.flow.bearish_premium:,.0f}")
     print(f"  2. Darkpool   {result.darkpool.score:5.1f}  {direction_emoji.get(result.darkpool.signal, '')} "
           f"Large prints={result.darkpool.large_prints} "
           f"Activity={result.darkpool.activity_level} "
@@ -1801,6 +2051,31 @@ def print_report(result: StrategyResult):
         print(f"\n  💡 SUGGESTION: Watch for confirmation. Paper trade or small size only.")
     else:
         print(f"\n  💡 SUGGESTION: No trade. Insufficient conviction.")
+
+    # Trade plan
+    tp = result.trade_plan
+    if tp and tp.entry_price:
+        print(f"\n  {'─'*56}")
+        print(f"  TRADE PLAN:")
+        print(f"  {'─'*56}")
+        arrow = "▲" if result.direction == Signal.BULLISH else "▼"
+        print(f"  {arrow} Entry:       ${tp.entry_price:.2f}")
+        print(f"  🛑 Stop:        ${tp.stop_price:.2f} (-{tp.stop_pct:.1f}%) — {tp.stop_reason}")
+        print(f"  🎯 Target:      ${tp.target_price:.2f} (+{tp.target_pct:.1f}%) — {tp.target_reason}")
+        print(f"  �� R/R:         {tp.risk_reward}:1")
+        if tp.suggested_strike:
+            contract_type = "call" if result.direction == Signal.BULLISH else "put"
+            print(f"\n  SUGGESTED CONTRACT:")
+            print(f"  📋 ${tp.suggested_strike:.0f} {contract_type}, {tp.suggested_expiry} ({tp.suggested_dte})")
+            print(f"     Delta ≈{tp.suggested_delta:.2f} → {tp.option_leverage}x leverage")
+            if tp.strike_reason:
+                print(f"     Why: {tp.strike_reason}")
+        print(f"\n  OPTION MANAGEMENT:")
+        print(f"  💰 Take profit:  +{tp.premium_target_pct:.0f}% premium → close")
+        print(f"  📈 Trailing:     activate at +{tp.trail_activate_pct:.0f}%, trail {tp.trail_stop_pct:.0f}% from peak")
+        print(f"  🛑 Hard stop:    {tp.premium_stop_pct:.0f}% on premium")
+        print(f"  ⏰ Theta kill:   close if <{tp.theta_kill_move_pct:.0f}% move by day {tp.theta_kill_days}")
+        print(f"  📅 Max hold:     {tp.max_hold_days} days")
 
     # Top flow details
     if result.flow.details:
@@ -1888,7 +2163,8 @@ def run_backtest(start_date: str, end_date: str, top_n: int = 5,
             time.sleep(delay)
 
             try:
-                result = analyze_ticker(ticker, date=day)
+                regime = _get_spy_regime(spy_prices, day)
+                result = analyze_ticker(ticker, date=day, regime=regime)
             except Exception as e:
                 log.warning(f"[BACKTEST] {day} {ticker}: Analysis failed: {e}")
                 continue
@@ -2185,7 +2461,7 @@ def format_telegram_message(result: StrategyResult) -> str:
         f"{'─'*30}",
         f"<b>LAYER BREAKDOWN</b>",
         f"{'─'*30}",
-        f"1. Flow       {result.flow.score:5.1f} {de(result.flow.signal, '')}  Bull={result.flow.bullish_sweeps} Bear={result.flow.bearish_sweeps}  RawPrem=${result.flow.total_premium:,.0f} WtPrem=${result.flow.total_premium_weighted:,.0f}",
+        f"1. Flow       {result.flow.score:5.1f} {de(result.flow.signal, '')}  Bull={result.flow.bullish_sweeps} Bear={result.flow.bearish_sweeps}  BullPrem=${result.flow.bullish_premium:,.0f} BearPrem=${result.flow.bearish_premium:,.0f}",
         f"2. Darkpool   {result.darkpool.score:5.1f} {de(result.darkpool.signal, '')}  Lg prints={result.darkpool.large_prints}  Activity={result.darkpool.activity_level}",
         f"3. GEX        {result.gex.score:5.1f} {de(result.gex.signal, '')}  MaxGamma=${result.gex.max_gamma_strike}  Flip={result.gex.gamma_flip}",
         f"4. IV         {result.iv.score:5.1f} {de(result.iv.signal, '')}  Pctl={result.iv.iv_percentile:.0f}  IV={result.iv.iv_current:.1%}" if result.iv.iv_current else f"4. IV         {result.iv.score:5.1f} {de(result.iv.signal, '')}  Pctl=N/A  IV=N/A",
@@ -2220,6 +2496,32 @@ def format_telegram_message(result: StrategyResult) -> str:
         lines.append(f"\n💡 Watch for confirmation — paper trade or small size only")
     else:
         lines.append(f"\n💡 No trade — insufficient conviction")
+
+    # Trade plan
+    tp = result.trade_plan
+    if tp and tp.entry_price:
+        arrow = "▲" if result.direction == Signal.BULLISH else "▼"
+        lines.append(f"\n{'─'*30}")
+        lines.append(f"<b>TRADE PLAN</b>")
+        lines.append(f"{'─'*30}")
+        lines.append(f"{arrow} Entry:  ${tp.entry_price:.2f}")
+        lines.append(f"🛑 Stop:   ${tp.stop_price:.2f} (-{tp.stop_pct:.1f}%) {tp.stop_reason}")
+        lines.append(f"🎯 Target: ${tp.target_price:.2f} (+{tp.target_pct:.1f}%)")
+        lines.append(f"  {tp.target_reason}")
+        lines.append(f"📐 R/R:    {tp.risk_reward}:1")
+        if tp.suggested_strike:
+            ct = "call" if result.direction == Signal.BULLISH else "put"
+            lines.append(f"")
+            lines.append(f"<b>Contract</b>")
+            lines.append(f"📋 ${tp.suggested_strike:.0f} {ct}, {tp.suggested_expiry} ({tp.suggested_dte})")
+            lines.append(f"  δ≈{tp.suggested_delta:.2f} → {tp.option_leverage}x leverage")
+        lines.append(f"")
+        lines.append(f"<b>Option Mgmt</b>")
+        lines.append(f"💰 TP: +{tp.premium_target_pct:.0f}% premium")
+        lines.append(f"📈 Trail: +{tp.trail_activate_pct:.0f}% activate, {tp.trail_stop_pct:.0f}% from peak")
+        lines.append(f"🛑 Hard stop: {tp.premium_stop_pct:.0f}% on premium")
+        lines.append(f"⏰ Theta kill: day {tp.theta_kill_days} if &lt;{tp.theta_kill_move_pct:.0f}% move")
+        lines.append(f"📅 Max hold: {tp.max_hold_days}d")
 
     # Top flow prints
     if result.flow.details:
@@ -2261,6 +2563,15 @@ def send_telegram_alert(result: StrategyResult) -> bool:
         return False
 
 
+def _flow_contradicts(result) -> bool:
+    """True when flow direction actively disagrees with composite direction."""
+    flow_sig = result.flow.signal
+    direction = result.direction
+    if flow_sig == Signal.NEUTRAL or direction == Signal.NEUTRAL:
+        return False
+    return flow_sig != direction
+
+
 # ---------------------------------------------------------------------------
 # Live WebSocket Monitor
 # ---------------------------------------------------------------------------
@@ -2299,17 +2610,19 @@ class LiveMonitor:
         log.info(f"[LIVE] {'='*50}")
 
         try:
-            result = analyze_ticker(ticker)
+            today = datetime.now().strftime("%Y-%m-%d")
+            if self._regime_cache[0] != today:
+                self._regime_cache = (today, get_current_regime())
+
+            result = analyze_ticker(ticker, regime=self._regime_cache[1])
             result = self._apply_live_enhancements(result, ticker)
             print_report(result)
 
             r_level = self._conviction_order.index(result.conviction)
             min_level = self._conviction_order.index(self.min_conviction)
 
-            today = datetime.now().strftime("%Y-%m-%d")
-            if self._regime_cache[0] != today:
-                self._regime_cache = (today, get_current_regime())
-            persistence.save_signal(result, mode="live", regime=self._regime_cache[1])
+            persistence.save_signal(result, mode="live", regime=self._regime_cache[1],
+                                       flow_contradicts=_flow_contradicts(result))
 
             if self.send_telegram and r_level >= min_level:
                 send_telegram_alert(result)
@@ -2692,19 +3005,22 @@ def main():
     if args.scan:
         candidates = scan_flow_for_candidates(min_premium=args.min_premium)
         for ticker in candidates[:5]:
-            result = analyze_ticker(ticker)
+            result = analyze_ticker(ticker, regime=regime)
             results.append(result)
-            persistence.save_signal(result, mode="scan", regime=regime)
+            persistence.save_signal(result, mode="scan", regime=regime,
+                                       flow_contradicts=_flow_contradicts(result))
     elif args.watchlist:
         tickers = [t.strip().upper() for t in args.watchlist.split(",")]
         for ticker in tickers:
-            result = analyze_ticker(ticker)
+            result = analyze_ticker(ticker, regime=regime)
             results.append(result)
-            persistence.save_signal(result, mode="manual", regime=regime)
+            persistence.save_signal(result, mode="manual", regime=regime,
+                                       flow_contradicts=_flow_contradicts(result))
     elif args.ticker:
-        result = analyze_ticker(args.ticker)
+        result = analyze_ticker(args.ticker, regime=regime)
         results.append(result)
-        persistence.save_signal(result, mode="manual", regime=regime)
+        persistence.save_signal(result, mode="manual", regime=regime,
+                                   flow_contradicts=_flow_contradicts(result))
     else:
         parser.print_help()
         sys.exit(0)
