@@ -1759,8 +1759,23 @@ def compute_trade_plan(result: StrategyResult, regime: str = None) -> TradePlan:
     reward = abs(tp.target_price - price)
     tp.risk_reward = round(reward / risk, 1) if risk > 0 else 0
 
+    # --- DTE Guidance (computed first so contract selector can use it) ---
+    flow_dtes = [d['dte'] for d in result.flow.details
+                 if d.get('dte') and 6 <= d['dte'] <= 180]
+    if flow_dtes:
+        median_dte = sorted(flow_dtes)[len(flow_dtes) // 2]
+        dte_min = max(median_dte, 21)
+        dte_max = dte_min + 21
+    elif earnings_dte is not None and earnings_dte <= 30:
+        dte_min = earnings_dte + 7
+        dte_max = earnings_dte + 21
+    else:
+        dte_min = 21
+        dte_max = 45
+    tp.suggested_dte = f"{dte_min}-{dte_max} DTE"
+
     # --- Suggested Contract ---
-    # Filter: correct option type, OTM only, 6-90 DTE, strike within reasonable range
+    # Filter: correct option type, OTM only, DTE within guidance range, strike within range
     # Among passing prints, pick closest to ATM (higher delta, more realistic TP)
     max_otm = min(max(tp.target_pct * 2, 8.0) / 100, 0.15)
     want_type = "CALL" if is_bull else "PUT"
@@ -1768,7 +1783,7 @@ def compute_trade_plan(result: StrategyResult, regime: str = None) -> TradePlan:
     top_premium_flow = None
     for d in result.flow.details:
         d_dte = d.get('dte')
-        if not d_dte or d_dte < 6 or d_dte > 90:
+        if not d_dte or d_dte < dte_min or d_dte > dte_max:
             continue
         if d.get('type', '').upper() != want_type:
             continue
@@ -1827,18 +1842,6 @@ def compute_trade_plan(result: StrategyResult, regime: str = None) -> TradePlan:
     tp.premium_stop_pct = -40.0
     tp.trail_activate_pct = round(tp.premium_target_pct * 0.6, 0)
     tp.trail_stop_pct = 20.0
-
-    # --- DTE Guidance ---
-    flow_dtes = [d['dte'] for d in result.flow.details
-                 if d.get('dte') and 6 <= d['dte'] <= 180]
-    if flow_dtes:
-        median_dte = sorted(flow_dtes)[len(flow_dtes) // 2]
-        min_dte = max(median_dte, 21)
-        tp.suggested_dte = f"{min_dte}-{min_dte + 21} DTE"
-    elif earnings_dte is not None and earnings_dte <= 30:
-        tp.suggested_dte = f"{earnings_dte + 7}-{earnings_dte + 21} DTE"
-    else:
-        tp.suggested_dte = "21-45 DTE"
 
     log.info(
         f"[TRADE] {result.ticker}: Entry=${tp.entry_price} | "
