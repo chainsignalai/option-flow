@@ -231,7 +231,7 @@ def place_paper_trade(result) -> Optional[PaperPosition]:
         _load_positions()
     _positions.append(pos)
     _save_positions()
-    return pos
+    return pos if pos.status != "REJECTED" else None
 
 
 def check_and_manage_positions():
