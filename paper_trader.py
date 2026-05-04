@@ -154,6 +154,13 @@ def place_paper_trade(result) -> Optional[PaperPosition]:
     if result.direction == Signal.NEUTRAL:
         return None
 
+    if not _positions:
+        _load_positions()
+    open_tickers = {p.ticker for p in _positions if p.status in ("PENDING", "FILLED")}
+    if result.ticker in open_tickers:
+        log.info("[PAPER] %s: Already has open position — skipping duplicate", result.ticker)
+        return None
+
     is_bull = result.direction == Signal.BULLISH
     option_type = "CALL" if is_bull else "PUT"
 
