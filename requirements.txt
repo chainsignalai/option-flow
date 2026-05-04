@@ -2,4 +2,4 @@ httpx>=0.28
 python-dotenv>=1.0
 websockets>=15.0
 supabase>=2.0
-webull-openapi-python-sdk>=2.0
+alpaca-py>=0.43
