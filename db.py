@@ -128,6 +128,39 @@ def save_backtest_trades(trades: list, run_id: str):
         log.error(f"[DB] Failed to save backtest trades: {e}")
 
 
+def log_paper_event(position_id: str, ticker: str, event_type: str, **kwargs):
+    """Log a paper trade state change to Supabase.
+
+    event_type: ENTRY, FILL, TRAIL_ACTIVATED, TP_HIT, HARD_STOP, TRAIL_STOP,
+                THETA_KILL, MAX_HOLD, ORDER_REJECTED, ORDER_CANCELLED, ORDER_EXPIRED
+    """
+    client = _get_client()
+    if not client:
+        return
+    try:
+        row = {
+            "position_id": position_id,
+            "ticker": ticker,
+            "event_type": event_type,
+            "direction": kwargs.get("direction"),
+            "option_type": kwargs.get("option_type"),
+            "strike": kwargs.get("strike"),
+            "expiry": kwargs.get("expiry"),
+            "price": kwargs.get("price"),
+            "filled_price": kwargs.get("filled_price"),
+            "pnl_pct": kwargs.get("pnl_pct"),
+            "peak_premium": kwargs.get("peak_premium"),
+            "trail_active": kwargs.get("trail_active", False),
+            "close_reason": kwargs.get("close_reason"),
+            "metadata": kwargs.get("metadata", {}),
+        }
+        row = {k: v for k, v in row.items() if v is not None}
+        client.table("paper_trade_events").insert(row).execute()
+        log.info(f"[DB] Paper event: {ticker} {event_type}")
+    except Exception as e:
+        log.error(f"[DB] Failed to log paper event for {ticker}: {e}")
+
+
 def _serialize_result(result) -> dict:
     """Convert StrategyResult to a JSON-safe dict."""
     try:

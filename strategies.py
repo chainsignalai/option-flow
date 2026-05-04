@@ -2586,11 +2586,12 @@ class LiveMonitor:
     """Persistent websocket monitor — triggers 7-layer analysis on qualifying flow."""
 
     def __init__(self, min_premium=100_000, min_conviction="MEDIUM",
-                 cooldown_minutes=5, send_telegram=True):
+                 cooldown_minutes=5, send_telegram=True, paper_trade=False):
         self.min_premium = min_premium
         self.min_conviction = min_conviction
         self.cooldown_minutes = cooldown_minutes
         self.send_telegram = send_telegram
+        self.paper_trade = paper_trade
         self._last_analysis: dict[str, datetime] = {}
         self._running = True
         self._conviction_order = ["NONE", "LOW", "MEDIUM", "HIGH", "VERY_HIGH"]
@@ -2628,12 +2629,27 @@ class LiveMonitor:
             r_level = self._conviction_order.index(result.conviction)
             min_level = self._conviction_order.index(self.min_conviction)
 
-            persistence.save_signal(result, mode="live", regime=self._regime_cache[1],
+            regime = self._regime_cache[1]
+            persistence.save_signal(result, mode="live", regime=regime,
                                        flow_contradicts=_flow_contradicts(result))
+
+            if regime == "NEUTRAL":
+                log.info(f"[LIVE] {ticker}: NEUTRAL regime — logged but skipping alert/trade (PF 0.93 over 126 trades)")
+                return
 
             if self.send_telegram and r_level >= min_level:
                 send_telegram_alert(result)
                 log.info(f"[LIVE] 📱 Telegram alert sent for {ticker} ({result.conviction})")
+
+                if self.paper_trade and result.trade_plan:
+                    try:
+                        from paper_trader import place_paper_trade
+                        pos = place_paper_trade(result)
+                        if pos:
+                            log.info(f"[LIVE] 📄 Paper trade placed for {ticker}: {pos.option_type} ${pos.strike} exp {pos.expiry}")
+                    except Exception as e:
+                        log.error(f"[LIVE] Paper trade failed for {ticker}: {e}")
+
             elif self.send_telegram:
                 log.info(f"[LIVE] {ticker}: Conviction {result.conviction} below threshold {self.min_conviction} — no Telegram")
         except Exception as e:
@@ -2843,6 +2859,15 @@ class LiveMonitor:
 
         return result
 
+    async def _paper_position_loop(self):
+        from paper_trader import check_and_manage_positions
+        while self._running:
+            try:
+                await asyncio.sleep(120)
+                await asyncio.to_thread(check_and_manage_positions)
+            except Exception as e:
+                log.error(f"[LIVE] Paper position check error: {e}")
+
     async def run(self):
         try:
             import websockets
@@ -2859,8 +2884,12 @@ class LiveMonitor:
         log.info(f"[LIVE] 🟢 ChainSignal LIVE MONITOR starting")
         log.info(f"[LIVE] Filters: min_premium=${self.min_premium:,} | min_conviction={self.min_conviction} | cooldown={self.cooldown_minutes}min")
         log.info(f"[LIVE] Telegram: {'ON' if self.send_telegram else 'OFF'}")
+        log.info(f"[LIVE] Paper trading: {'ON' if self.paper_trade else 'OFF'}")
         log.info(f"[LIVE] ETF filter: {len(ETF_BLACKLIST)} tickers excluded")
         log.info(f"[LIVE] {'='*50}")
+
+        if self.paper_trade:
+            asyncio.ensure_future(self._paper_position_loop())
 
         while self._running:
             try:
@@ -2947,6 +2976,8 @@ def main():
     parser.add_argument("--telegram-min-conviction", type=str, default="MEDIUM",
                         choices=["NONE", "LOW", "MEDIUM", "HIGH", "VERY_HIGH"],
                         help="Minimum conviction to trigger Telegram alert (default: MEDIUM)")
+    parser.add_argument("--paper", action="store_true",
+                        help="Enable Webull paper trading in live mode")
     parser.add_argument("--backtest", action="store_true",
                         help="Run historical backtest over date range")
     parser.add_argument("--start-date", type=str, help="Backtest start date (YYYY-MM-DD)")
@@ -2974,6 +3005,7 @@ def main():
             min_conviction=args.telegram_min_conviction,
             cooldown_minutes=args.cooldown,
             send_telegram=live_telegram,
+            paper_trade=args.paper,
         )
         try:
             asyncio.run(monitor.run())
