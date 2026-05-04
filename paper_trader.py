@@ -16,9 +16,14 @@ from typing import Optional
 from dotenv import load_dotenv
 from db import log_paper_event
 
+import httpx
+
 load_dotenv()
 
 log = logging.getLogger(__name__)
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
@@ -49,6 +54,21 @@ def _get_data_client():
     from alpaca.data.historical.option import OptionHistoricalDataClient
     _data_client = OptionHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
     return _data_client
+
+
+def _send_paper_telegram(message: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        httpx.post(url, json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }, timeout=10)
+    except Exception as e:
+        log.error("[PAPER] Telegram send failed: %s", e)
 
 
 def _build_occ_symbol(ticker: str, expiry: str, option_type: str, strike: float) -> str:
@@ -205,6 +225,13 @@ def place_paper_trade(result) -> Optional[PaperPosition]:
                 "underlying_entry": pos.underlying_entry,
             },
         )
+        _send_paper_telegram(
+            f"📄 <b>PAPER TRADE OPENED</b>\n"
+            f"{result.ticker} {option_type} ${strike:.0f} exp {expiry[:10]}\n"
+            f"Limit: ${limit_price:.2f} | {result.conviction}\n"
+            f"TP: {pos.premium_target_pct:+.0f}% | Stop: {pos.premium_stop_pct:+.0f}% | "
+            f"Trail: {pos.trail_activate_pct:.0f}%/{pos.trail_stop_pct:.0f}%"
+        )
     except Exception as e:
         log.error("[PAPER] %s: Order failed — %s", result.ticker, e)
         pos.status = "REJECTED"
@@ -322,6 +349,11 @@ def _check_pending_order(tc, pos: PaperPosition, now: datetime):
                 strike=pos.strike, expiry=pos.expiry,
                 filled_price=avg_price, price=avg_price,
             )
+            _send_paper_telegram(
+                f"✅ <b>PAPER FILL</b>\n"
+                f"{pos.ticker} {pos.option_type} ${pos.strike:.0f} exp {pos.expiry}\n"
+                f"Filled @ ${avg_price:.2f}"
+            )
         elif status in ("canceled", "cancelled", "expired", "rejected"):
             pos.status = "CLOSED"
             pos.close_reason = status
@@ -401,6 +433,13 @@ def _close_position(tc, pos: PaperPosition, current_price: float, reason: str):
         price=current_price, filled_price=pos.filled_price,
         pnl_pct=pos.pnl_pct, peak_premium=pos.peak_premium,
         trail_active=pos.trail_active, close_reason=reason,
+    )
+    pnl_emoji = "🟢" if pos.pnl_pct and pos.pnl_pct > 0 else "🔴"
+    _send_paper_telegram(
+        f"{pnl_emoji} <b>PAPER TRADE CLOSED</b>\n"
+        f"{pos.ticker} {pos.option_type} ${pos.strike:.0f} exp {pos.expiry}\n"
+        f"Entry: ${pos.filled_price:.2f} → Exit: ${current_price:.2f}\n"
+        f"PnL: {pos.pnl_pct:+.1f}% | Reason: {reason}"
     )
 
 
