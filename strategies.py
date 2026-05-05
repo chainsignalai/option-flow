@@ -3224,10 +3224,20 @@ class LiveMonitor:
 
     async def _option_stream_loop(self):
         from paper_trader import start_option_stream
+        backoff = 5
         while self._running:
             try:
                 log.info("[LIVE] 📊 Starting real-time option quote stream")
                 await start_option_stream()
+                backoff = 5
+            except ValueError as e:
+                if "connection limit" in str(e).lower():
+                    log.warning(f"[LIVE] Option stream connection limit exceeded, retrying in {backoff}s")
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 60)
+                else:
+                    log.error(f"[LIVE] Option stream auth error (retrying in 5s): {e}")
+                    await asyncio.sleep(5)
             except Exception as e:
                 log.error(f"[LIVE] Option stream error (reconnecting in 5s): {e}")
                 await asyncio.sleep(5)

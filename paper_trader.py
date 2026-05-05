@@ -1000,9 +1000,45 @@ async def start_option_stream():
     if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
         log.warning("[PAPER] No Alpaca credentials — option stream disabled")
         return
+    from alpaca.data.live.option import OptionDataStream
+
+    class _SafeOptionStream(OptionDataStream):
+        async def _run_forever(self):
+            import websockets as _ws
+            while not any(
+                v for k, v in self._handlers.items()
+                if k not in ("cancelErrors", "corrections")
+            ):
+                if not self._stop_stream_queue.empty():
+                    self._stop_stream_queue.get(timeout=1)
+                    return
+                await asyncio.sleep(0)
+            self._should_run = True
+            self._running = False
+            while True:
+                try:
+                    if not self._should_run:
+                        return
+                    if not self._running:
+                        await self._start_ws()
+                        await self._send_subscribe_msg()
+                        self._running = True
+                    await self._consume()
+                except _ws.WebSocketException as wse:
+                    await self.close()
+                    self._running = False
+                    log.warning("[PAPER] Option WS error, restarting: %s", wse)
+                except ValueError as ve:
+                    await self.close()
+                    self._running = False
+                    raise
+                except Exception as e:
+                    log.error("[PAPER] Option stream unexpected error: %s", e)
+                finally:
+                    await asyncio.sleep(0)
+
     try:
-        from alpaca.data.live.option import OptionDataStream
-        _option_stream = OptionDataStream(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+        _option_stream = _SafeOptionStream(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 
         if not _positions_loaded:
             _load_positions()
@@ -1015,5 +1051,8 @@ async def start_option_stream():
 
         log.info("[PAPER] 📊 Real-time option quote stream starting")
         await _option_stream._run_forever()
+    except ValueError as e:
+        log.error("[PAPER] Option stream auth error: %s", e)
+        raise
     except Exception as e:
         log.error("[PAPER] Option stream error: %s", e)
