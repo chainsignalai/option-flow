@@ -395,6 +395,8 @@ def check_and_manage_positions():
                     continue
 
             hold_start = pos.filled_at or pos.opened_at
+            if not hold_start:
+                continue
             days_held = (now - datetime.fromisoformat(hold_start)).days
             if days_held >= pos.theta_kill_days:
                 underlying_move = abs(pnl_pct)
@@ -873,12 +875,18 @@ async def _handle_option_quote(data):
         now = datetime.now()
         loop = asyncio.get_event_loop()
 
-        if pnl_pct <= pos.premium_stop_pct:
+        async def _try_close(reason: str):
             await loop.run_in_executor(
-                None, lambda: _close_position(tc, pos, current_price, f"hard stop ({pnl_pct:+.1f}%)"))
-            await loop.run_in_executor(None, _sync_save)
-            await _unsubscribe_option_quotes([symbol])
-            return
+                None, lambda: _close_position(tc, pos, current_price, reason))
+            if pos.status == "CLOSED":
+                await loop.run_in_executor(None, _sync_save)
+                await _unsubscribe_option_quotes([symbol])
+                return True
+            return False
+
+        if pnl_pct <= pos.premium_stop_pct:
+            if await _try_close(f"hard stop ({pnl_pct:+.1f}%)"):
+                return
 
         if pos.strategy_type == "LEAP" and pos.underlying_entry > 0:
             try:
@@ -897,23 +905,16 @@ async def _handle_option_quote(data):
                             stock_move_pct = (stock_price - pos.underlying_entry) / pos.underlying_entry * 100
                             is_bull = pos.direction == "BULLISH"
                             if (is_bull and stock_move_pct <= -25) or (not is_bull and stock_move_pct >= 25):
-                                await loop.run_in_executor(
-                                    None, lambda: _close_position(
-                                        tc, pos, current_price,
+                                if await _try_close(
                                         f"underlying stop ({pos.ticker} {stock_move_pct:+.1f}% "
-                                        f"from ${pos.underlying_entry:.2f})"))
-                                await loop.run_in_executor(None, _sync_save)
-                                await _unsubscribe_option_quotes([symbol])
-                                return
+                                        f"from ${pos.underlying_entry:.2f})"):
+                                    return
             except Exception as e:
                 log.error("[PAPER] LEAP underlying check failed for %s: %s", pos.ticker, e)
 
         if pnl_pct >= pos.premium_target_pct:
-            await loop.run_in_executor(
-                None, lambda: _close_position(tc, pos, current_price, f"profit target ({pnl_pct:+.1f}%)"))
-            await loop.run_in_executor(None, _sync_save)
-            await _unsubscribe_option_quotes([symbol])
-            return
+            if await _try_close(f"profit target ({pnl_pct:+.1f}%)"):
+                return
 
         if pnl_pct >= pos.trail_activate_pct and not pos.trail_active:
             pos.trail_active = True
@@ -929,31 +930,19 @@ async def _handle_option_quote(data):
         if pos.trail_active and pos.peak_premium:
             drawdown_from_peak = (pos.peak_premium - current_price) / pos.peak_premium * 100
             if drawdown_from_peak >= pos.trail_stop_pct:
-                await loop.run_in_executor(
-                    None, lambda: _close_position(
-                        tc, pos, current_price,
-                        f"trailing stop (peak=${pos.peak_premium:.2f}, drawdown={drawdown_from_peak:.1f}%)"))
-                await loop.run_in_executor(None, _sync_save)
-                await _unsubscribe_option_quotes([symbol])
-                return
+                if await _try_close(
+                        f"trailing stop (peak=${pos.peak_premium:.2f}, drawdown={drawdown_from_peak:.1f}%)"):
+                    return
 
         hold_start = pos.filled_at or pos.opened_at
         if hold_start:
             days_held = (now - datetime.fromisoformat(hold_start)).days
             if days_held >= pos.theta_kill_days and abs(pnl_pct) < pos.theta_kill_move_pct:
-                await loop.run_in_executor(
-                    None, lambda: _close_position(
-                        tc, pos, current_price,
-                        f"theta kill (day {days_held}, move={pnl_pct:+.1f}%)"))
-                await loop.run_in_executor(None, _sync_save)
-                await _unsubscribe_option_quotes([symbol])
-                return
+                if await _try_close(f"theta kill (day {days_held}, move={pnl_pct:+.1f}%)"):
+                    return
             if days_held >= pos.max_hold_days:
-                await loop.run_in_executor(
-                    None, lambda: _close_position(tc, pos, current_price, f"max hold ({days_held}d)"))
-                await loop.run_in_executor(None, _sync_save)
-                await _unsubscribe_option_quotes([symbol])
-                return
+                if await _try_close(f"max hold ({days_held}d)"):
+                    return
 
     except Exception as e:
         log.error("[PAPER] Option quote handler error for %s: %s",
