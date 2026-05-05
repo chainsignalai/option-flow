@@ -110,6 +110,7 @@ class PaperPosition:
     close_reason: str = ""
     close_price: Optional[float] = None
     pnl_pct: Optional[float] = None
+    strategy_type: str = "SWING"
 
 
 POSITIONS_FILE = os.path.join(os.path.dirname(__file__), "paper_positions.json")
@@ -156,9 +157,10 @@ def place_paper_trade(result) -> Optional[PaperPosition]:
 
     if not _positions:
         _load_positions()
-    open_tickers = {p.ticker for p in _positions if p.status in ("PENDING", "FILLED")}
-    if result.ticker in open_tickers:
-        log.info("[PAPER] %s: Already has open position — skipping duplicate", result.ticker)
+    open_swing_tickers = {p.ticker for p in _positions
+                          if p.status in ("PENDING", "FILLED") and p.strategy_type == "SWING"}
+    if result.ticker in open_swing_tickers:
+        log.info("[PAPER] %s: Already has open swing position — skipping duplicate", result.ticker)
         return None
 
     is_bull = result.direction == Signal.BULLISH
@@ -376,16 +378,16 @@ def _check_pending_order(tc, pos: PaperPosition, now: datetime):
         log.error("[PAPER] Failed to check order for %s: %s", pos.ticker, e)
 
 
-def _get_current_option_price(pos: PaperPosition) -> Optional[float]:
-    """Get the current mid price of the option from Alpaca market data."""
+def _get_option_mid_price(occ_symbol: str) -> Optional[float]:
+    """Get the current mid price of an option from Alpaca market data."""
     dc = _get_data_client()
     if not dc:
         return None
     try:
         from alpaca.data.requests import OptionLatestQuoteRequest
-        req = OptionLatestQuoteRequest(symbol_or_symbols=[pos.occ_symbol])
+        req = OptionLatestQuoteRequest(symbol_or_symbols=[occ_symbol])
         quotes = dc.get_option_latest_quote(req)
-        quote = quotes.get(pos.occ_symbol)
+        quote = quotes.get(occ_symbol)
         if quote and quote.bid_price and quote.ask_price:
             return round((float(quote.bid_price) + float(quote.ask_price)) / 2, 2)
         if quote and quote.bid_price:
@@ -393,8 +395,13 @@ def _get_current_option_price(pos: PaperPosition) -> Optional[float]:
         if quote and quote.ask_price:
             return float(quote.ask_price)
     except Exception as e:
-        log.error("[PAPER] Failed to get price for %s (%s): %s", pos.ticker, pos.occ_symbol, e)
+        log.error("[PAPER] Failed to get mid price for %s: %s", occ_symbol, e)
     return None
+
+
+def _get_current_option_price(pos: PaperPosition) -> Optional[float]:
+    """Get the current mid price of a position's option."""
+    return _get_option_mid_price(pos.occ_symbol)
 
 
 def _reason_to_event_type(reason: str) -> str:
@@ -448,6 +455,141 @@ def _close_position(tc, pos: PaperPosition, current_price: float, reason: str):
         f"Entry: ${pos.filled_price:.2f} → Exit: ${current_price:.2f}\n"
         f"PnL: {pos.pnl_pct:+.1f}% | Reason: {reason}"
     )
+
+
+def place_leap_trade(result, trade_plan) -> Optional[PaperPosition]:
+    """Place a paper LEAP option order via Alpaca."""
+    tc = _get_trading_client()
+    if not tc:
+        log.warning("[LEAP] No trading client — skipping")
+        return None
+
+    if not trade_plan or not trade_plan.suggested_strike or not trade_plan.suggested_expiry:
+        log.info("[LEAP] %s: No strike/expiry in trade plan — skipping", result.ticker)
+        return None
+
+    from strategies import Signal
+    is_bull = result.direction == Signal.BULLISH
+    option_type = "CALL" if is_bull else "PUT"
+
+    strike = trade_plan.suggested_strike
+    expiry = trade_plan.suggested_expiry
+    occ_symbol = _build_occ_symbol(result.ticker, expiry, option_type, strike)
+
+    mid_price = _get_option_mid_price(occ_symbol)
+    if not mid_price or mid_price <= 0:
+        log.warning("[LEAP] %s: Could not get option price for %s — skipping", result.ticker, occ_symbol)
+        return None
+
+    if not _positions:
+        _load_positions()
+    open_leap_tickers = {p.ticker for p in _positions
+                         if p.status in ("PENDING", "FILLED") and p.strategy_type == "LEAP"}
+    if result.ticker in open_leap_tickers:
+        log.info("[LEAP] %s: Already has open LEAP position — skipping duplicate", result.ticker)
+        return None
+
+    MAX_LEAP_ALLOCATION = 0.20
+    try:
+        acct = tc.get_account()
+        equity = float(acct.equity)
+        leap_exposure = sum(
+            (p.filled_price or p.limit_price) * 100 * p.quantity
+            for p in _positions
+            if p.status in ("PENDING", "FILLED") and p.strategy_type == "LEAP"
+        )
+        new_cost = mid_price * 100
+        if (leap_exposure + new_cost) / equity > MAX_LEAP_ALLOCATION:
+            log.info(
+                "[LEAP] %s: Would exceed 20%% LEAP allocation "
+                "(current=$%,.0f + new=$%,.0f vs limit=$%,.0f) — skipping",
+                result.ticker, leap_exposure, new_cost, equity * MAX_LEAP_ALLOCATION,
+            )
+            return None
+    except Exception as e:
+        log.error("[LEAP] %s: Could not check allocation: %s", result.ticker, e)
+
+    pos = PaperPosition(
+        ticker=result.ticker,
+        direction=result.direction.value,
+        option_type=option_type,
+        strike=strike,
+        expiry=expiry[:10],
+        quantity=1,
+        limit_price=mid_price,
+        occ_symbol=occ_symbol,
+        strategy_type="LEAP",
+        premium_target_pct=trade_plan.premium_target_pct or 200.0,
+        premium_stop_pct=trade_plan.premium_stop_pct,
+        trail_activate_pct=trade_plan.trail_activate_pct or 100.0,
+        trail_stop_pct=trade_plan.trail_stop_pct,
+        max_hold_days=trade_plan.max_hold_days,
+        theta_kill_days=trade_plan.theta_kill_days,
+        theta_kill_move_pct=trade_plan.theta_kill_move_pct,
+        underlying_entry=trade_plan.entry_price,
+        opened_at=datetime.now().isoformat(),
+    )
+
+    try:
+        from alpaca.trading.requests import LimitOrderRequest
+        from alpaca.trading.enums import OrderSide, TimeInForce, PositionIntent
+
+        order_req = LimitOrderRequest(
+            symbol=occ_symbol,
+            qty=1,
+            side=OrderSide.BUY,
+            time_in_force=TimeInForce.GTC,
+            limit_price=mid_price,
+            position_intent=PositionIntent.BUY_TO_OPEN,
+        )
+        order = tc.submit_order(order_data=order_req)
+        pos.order_id = str(order.id)
+        pos.status = "PENDING"
+        log.info(
+            "[LEAP] %s: Order placed — %s $%.0f exp %s @ $%.2f limit | %s",
+            result.ticker, option_type, strike, expiry[:10], mid_price, occ_symbol,
+        )
+        log_paper_event(
+            pos.order_id, result.ticker, "LEAP_ENTRY",
+            direction=result.direction.value, option_type=option_type,
+            strike=strike, expiry=expiry[:10], price=mid_price,
+            metadata={
+                "occ_symbol": occ_symbol,
+                "strategy_type": "LEAP",
+                "conviction": result.conviction,
+                "composite_score": result.composite_score,
+                "premium_target_pct": pos.premium_target_pct,
+                "premium_stop_pct": pos.premium_stop_pct,
+                "trail_activate_pct": pos.trail_activate_pct,
+                "trail_stop_pct": pos.trail_stop_pct,
+                "max_hold_days": pos.max_hold_days,
+                "underlying_entry": pos.underlying_entry,
+            },
+        )
+        _send_paper_telegram(
+            f"🔭 <b>LEAP TRADE OPENED</b>\n"
+            f"{result.ticker} {option_type} ${strike:.0f} exp {expiry[:10]}\n"
+            f"Limit: ${mid_price:.2f} | {result.conviction}\n"
+            f"Stop: {pos.premium_stop_pct:.0f}% | No fixed TP — trail decides exit\n"
+            f"Trail: +{pos.trail_activate_pct:.0f}% activate → {pos.trail_stop_pct:.0f}% from peak\n"
+            f"Max hold: {pos.max_hold_days}d | No theta kill"
+        )
+    except Exception as e:
+        log.error("[LEAP] %s: Order failed — %s", result.ticker, e)
+        pos.status = "REJECTED"
+        pos.close_reason = str(e)
+        log_paper_event(
+            occ_symbol, result.ticker, "LEAP_ORDER_REJECTED",
+            direction=result.direction.value, option_type=option_type,
+            strike=strike, expiry=expiry[:10],
+            close_reason=str(e),
+        )
+
+    if not _positions:
+        _load_positions()
+    _positions.append(pos)
+    _save_positions()
+    return pos if pos.status != "REJECTED" else None
 
 
 def get_portfolio_summary() -> dict:

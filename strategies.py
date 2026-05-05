@@ -1855,6 +1855,128 @@ def compute_trade_plan(result: StrategyResult, regime: str = None) -> TradePlan:
     return tp
 
 
+def compute_leap_trade_plan(result: StrategyResult, leap_prints: list) -> Optional[TradePlan]:
+    """Generate a trade plan for a LEAP position based on accumulated flow prints."""
+    price = result.technicals.current_price
+    if not price:
+        return None
+
+    tp = TradePlan()
+    tp.entry_price = price
+
+    is_bull = result.direction == Signal.BULLISH
+
+    best_print = max(leap_prints, key=lambda p: float(p.get("premium", 0)))
+    tp.suggested_strike = float(best_print["strike"])
+    tp.suggested_expiry = str(best_print.get("expiry", ""))[:10]
+    dte = int(best_print.get("dte", 365))
+    tp.suggested_dte = f"{dte} DTE"
+
+    otm_pct = abs(tp.suggested_strike - price) / price if price else 0
+    if otm_pct <= 0.05:
+        tp.suggested_delta = 0.55
+    elif otm_pct <= 0.15:
+        tp.suggested_delta = 0.35
+    elif otm_pct <= 0.30:
+        tp.suggested_delta = 0.20
+    else:
+        tp.suggested_delta = 0.10
+    tp.option_leverage = round(1 / tp.suggested_delta, 1) if tp.suggested_delta > 0 else 5.0
+
+    tp.premium_target_pct = 99999.0
+    tp.premium_stop_pct = -50.0
+    tp.trail_activate_pct = 100.0
+    tp.trail_stop_pct = 25.0
+    tp.max_hold_days = 180
+    tp.theta_kill_days = 999
+    tp.theta_kill_move_pct = 0.0
+
+    tp.stop_pct = 25.0
+    if is_bull:
+        tp.stop_price = round(price * 0.75, 2)
+        tp.target_price = round(price * 1.50, 2)
+    else:
+        tp.stop_price = round(price * 1.25, 2)
+        tp.target_price = round(price * 0.50, 2)
+    tp.stop_reason = "25% underlying stop (LEAP)"
+    tp.target_pct = 50.0
+    tp.target_reason = f"LEAP target ({dte}DTE thesis)"
+
+    risk = abs(price - tp.stop_price)
+    reward = abs(tp.target_price - price)
+    tp.risk_reward = round(reward / risk, 1) if risk > 0 else 0
+
+    total_prem = sum(float(p.get("premium", 0)) for p in leap_prints)
+    tp.strike_reason = (
+        f"LEAP: following ${total_prem:,.0f} across {len(leap_prints)} prints — "
+        f"biggest ${float(best_print.get('premium', 0)):,.0f} "
+        f"{best_print.get('option_type', '')} at ${tp.suggested_strike:.0f}"
+    )
+
+    log.info(
+        f"[LEAP] {result.ticker}: Plan — {tp.suggested_dte} | "
+        f"Strike=${tp.suggested_strike:.0f} ({otm_pct:.0%} OTM) | "
+        f"Stop=${tp.stop_price:.2f} (-{tp.stop_pct:.0f}%) | "
+        f"No fixed TP | Trail +{tp.trail_activate_pct:.0f}%/{tp.trail_stop_pct:.0f}% | "
+        f"Prem stop={tp.premium_stop_pct:.0f}%"
+    )
+
+    return tp
+
+
+def send_leap_telegram_alert(ticker: str, leap_prints: list,
+                             result: StrategyResult, trade_plan: TradePlan) -> bool:
+    """Send Telegram alert for a LEAP candidate."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+
+    total_premium = sum(float(p.get("premium", 0)) for p in leap_prints)
+    n_prints = len(leap_prints)
+    sweep_count = sum(1 for p in leap_prints if p.get("is_sweep"))
+
+    bull_prem = sum(float(p.get("premium", 0)) for p in leap_prints if p.get("sentiment") == "BULL")
+    bear_prem = total_premium - bull_prem
+    direction = "BULLISH" if bull_prem > bear_prem else "BEARISH"
+
+    option_type = "CALL" if direction == "BULLISH" else "PUT"
+    strike = trade_plan.suggested_strike
+    expiry = trade_plan.suggested_expiry
+
+    msg = (
+        f"🔭 <b>LEAP SIGNAL</b>\n\n"
+        f"<b>{ticker}</b> — {direction}\n"
+        f"${strike:.0f} {option_type} exp {expiry} ({trade_plan.suggested_dte})\n\n"
+        f"📊 <b>Accumulation (5 days)</b>\n"
+        f"• {n_prints} prints | ${total_premium:,.0f} total\n"
+        f"• {sweep_count} sweeps | Bull ${bull_prem:,.0f} / Bear ${bear_prem:,.0f}\n\n"
+        f"📈 <b>Analysis</b>\n"
+        f"• Conviction: {result.conviction} | Score: {result.composite_score:.0f}/100\n"
+        f"• Layers aligned: {result.layers_aligned}/4\n"
+        f"• Flow: {result.flow.signal.value} | Tech: {result.technicals.signal.value}\n\n"
+        f"🎯 <b>LEAP Plan</b>\n"
+        f"• Entry: ${trade_plan.entry_price:.2f}\n"
+        f"• Underlying stop: ${trade_plan.stop_price:.2f} (-{trade_plan.stop_pct:.0f}%)\n"
+        f"• Premium stop: {trade_plan.premium_stop_pct:.0f}%\n"
+        f"• No fixed TP — trail decides exit\n"
+        f"• Trail: +{trade_plan.trail_activate_pct:.0f}% activate → {trade_plan.trail_stop_pct:.0f}% from peak\n"
+        f"• Max hold: {trade_plan.max_hold_days}d | No theta kill | Max 20% allocation"
+    )
+
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        httpx.post(url, json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": msg,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }, timeout=10)
+        log.info(f"[LEAP] {ticker}: Telegram alert sent")
+        return True
+    except Exception as e:
+        log.error(f"[LEAP] {ticker}: Telegram send failed: {e}")
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Main analysis pipeline
 # ---------------------------------------------------------------------------
@@ -2612,6 +2734,12 @@ class LiveMonitor:
         self._market_tide: dict = {}
         self._gex_cache: dict[str, dict] = {}
         self._regime_cache: tuple = ("", "NEUTRAL")
+        # LEAP accumulation tracking
+        self._leap_alerted: set[str] = set()
+        self._leap_min_premium = 100_000
+        self._leap_min_dte = 180
+        self._leap_accumulation_threshold = 300_000
+        self._leap_min_prints = 2
 
     def _should_analyze(self, ticker: str, premium: float) -> bool:
         if ticker in ETF_BLACKLIST:
@@ -2673,7 +2801,22 @@ class LiveMonitor:
         ticker = payload.get("ticker", "")
         premium = _float(payload.get("total_premium"))
 
-        if not ticker or not self._should_analyze(ticker, premium):
+        if not ticker or ticker in ETF_BLACKLIST:
+            return
+
+        # --- LEAP tracking (before swing cooldown/sweep filters) ---
+        expiry_str = payload.get("expiry", "")
+        if expiry_str and premium >= self._leap_min_premium:
+            try:
+                expiry_date = datetime.strptime(expiry_str[:10], "%Y-%m-%d").date()
+                dte = (expiry_date - datetime.now().date()).days
+                if dte >= self._leap_min_dte:
+                    self._track_leap_print(ticker, payload, dte)
+            except ValueError:
+                pass
+
+        # --- Swing analysis path ---
+        if not self._should_analyze(ticker, premium):
             return
 
         is_sweep = payload.get("has_sweep", False)
@@ -2872,6 +3015,133 @@ class LiveMonitor:
 
         return result
 
+    def _track_leap_print(self, ticker: str, payload: dict, dte: int):
+        """Track a LEAP flow print and persist to Supabase."""
+        option_type = str(payload.get("type", "")).upper()
+        premium = _float(payload.get("total_premium"))
+        strike = _float(payload.get("strike"))
+        expiry = payload.get("expiry", "")[:10]
+        underlying = _float(payload.get("underlying_price"))
+        is_sweep = payload.get("has_sweep", False)
+
+        ask_prem = _float(payload.get("total_ask_side_prem"))
+        bid_prem = _float(payload.get("total_bid_side_prem"))
+        side = "ASK" if ask_prem > bid_prem else "BID" if bid_prem > ask_prem else "MID"
+
+        is_bullish = (
+            (option_type == "CALL" and side == "ASK") or
+            (option_type == "PUT" and side == "BID")
+        )
+        sentiment = "BULL" if is_bullish else "BEAR"
+
+        sweep_label = "SWEEP" if is_sweep else "BLOCK"
+        log.info(
+            f"[LEAP] 🔭 {ticker}: {sweep_label} {option_type} ${premium:,.0f} | "
+            f"Strike=${strike:.0f} Exp={expiry} {dte}DTE | {side} → {sentiment}"
+        )
+
+        try:
+            persistence.save_leap_flow(
+                ticker=ticker, option_type=option_type, strike=strike,
+                expiry=expiry, dte=dte, premium=premium, is_sweep=is_sweep,
+                side=side, sentiment=sentiment, underlying_price=underlying,
+            )
+        except Exception as e:
+            log.error(f"[LEAP] Failed to persist LEAP flow for {ticker}: {e}")
+
+    def _run_leap_analysis(self, ticker: str, leap_prints: list):
+        """Run 7-layer analysis and generate LEAP trade plan for a candidate."""
+        log.info(f"[LEAP] {'='*50}")
+        log.info(f"[LEAP] 🔭 Running LEAP analysis for {ticker}")
+        log.info(f"[LEAP] {'='*50}")
+
+        try:
+            today = datetime.now().strftime("%Y-%m-%d")
+            if self._regime_cache[0] != today:
+                self._regime_cache = (today, get_current_regime())
+            regime = self._regime_cache[1]
+
+            result = analyze_ticker(ticker, regime=regime)
+
+            if result.direction == Signal.NEUTRAL:
+                log.info(f"[LEAP] {ticker}: NEUTRAL direction — skipping LEAP")
+                return
+
+            if regime == "NEUTRAL":
+                log.info(f"[LEAP] {ticker}: NEUTRAL regime — skipping LEAP")
+                return
+
+            trade_plan = compute_leap_trade_plan(result, leap_prints)
+            if not trade_plan:
+                log.info(f"[LEAP] {ticker}: Could not generate trade plan — skipping")
+                return
+
+            persistence.save_signal(result, mode="leap", regime=regime,
+                                    flow_contradicts=_flow_contradicts(result))
+
+            if self.send_telegram:
+                send_leap_telegram_alert(ticker, leap_prints, result, trade_plan)
+
+            if self.paper_trade:
+                try:
+                    from paper_trader import place_leap_trade
+                    pos = place_leap_trade(result, trade_plan)
+                    if pos:
+                        log.info(f"[LEAP] 📄 LEAP paper trade placed for {ticker}: "
+                                 f"{pos.option_type} ${pos.strike} exp {pos.expiry}")
+                except Exception as e:
+                    log.error(f"[LEAP] Paper trade failed for {ticker}: {e}")
+
+        except Exception as e:
+            log.error(f"[LEAP] Analysis failed for {ticker}: {e}")
+
+    async def _leap_scan_loop(self):
+        """Periodically check Supabase for LEAP accumulation candidates."""
+        await asyncio.sleep(60)
+        while self._running:
+            try:
+                await asyncio.to_thread(self._check_leap_candidates)
+            except Exception as e:
+                log.error(f"[LEAP] Scan loop error: {e}")
+            await asyncio.sleep(1800)
+
+    def _check_leap_candidates(self):
+        """Query Supabase for tickers with enough LEAP accumulation to analyze."""
+        accumulation = persistence.get_leap_accumulation(lookback_days=5)
+        if not accumulation:
+            return
+
+        for ticker, acc in accumulation.items():
+            if ticker in self._leap_alerted:
+                continue
+
+            n_prints = len(acc["prints"])
+            total_prem = acc["total_premium"]
+            bull_prem = acc["bull_premium"]
+            bear_prem = acc["bear_premium"]
+            total_dir = bull_prem + bear_prem
+
+            if n_prints < self._leap_min_prints:
+                continue
+            if total_prem < self._leap_accumulation_threshold:
+                continue
+            if total_dir > 0 and max(bull_prem, bear_prem) / total_dir < 0.65:
+                continue
+
+            if persistence.has_recent_leap_signal(ticker, hours=48):
+                log.info(f"[LEAP] {ticker}: LEAP signal fired <48h ago — skipping")
+                self._leap_alerted.add(ticker)
+                continue
+
+            log.info(
+                f"[LEAP] 🎯 {ticker}: LEAP accumulation detected — "
+                f"{n_prints} prints, ${total_prem:,.0f} total, "
+                f"bull=${bull_prem:,.0f} bear=${bear_prem:,.0f}"
+            )
+
+            self._leap_alerted.add(ticker)
+            self._run_leap_analysis(ticker, acc["prints"])
+
     async def _paper_position_loop(self):
         from paper_trader import check_and_manage_positions
         while self._running:
@@ -2911,6 +3181,7 @@ class LiveMonitor:
                     json={"chat_id": TELEGRAM_CHAT_ID, "text":
                         f"🟢 ChainSignal started\n"
                         f"Paper: {'ON' if self.paper_trade else 'OFF'} | {pos_line}\n"
+                        f"LEAP scanner: ON (180+ DTE, $300K+ accum)\n"
                         f"Telegram: ON | Cooldown: {self.cooldown_minutes}min",
                         "disable_web_page_preview": True},
                     timeout=10,
@@ -2920,6 +3191,9 @@ class LiveMonitor:
 
         if self.paper_trade:
             asyncio.ensure_future(self._paper_position_loop())
+
+        asyncio.ensure_future(self._leap_scan_loop())
+        log.info("[LIVE] 🔭 LEAP scan loop started (checks every 30min)")
 
         while self._running:
             try:

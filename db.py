@@ -161,6 +161,92 @@ def log_paper_event(position_id: str, ticker: str, event_type: str, **kwargs):
         log.error(f"[DB] Failed to log paper event for {ticker}: {e}")
 
 
+def save_leap_flow(ticker: str, option_type: str, strike: float, expiry: str,
+                   dte: int, premium: float, is_sweep: bool, side: str,
+                   sentiment: str, underlying_price: float):
+    """Persist a single LEAP flow print for accumulation tracking."""
+    client = _get_client()
+    if not client:
+        return
+    try:
+        row = {
+            "ticker": ticker,
+            "option_type": option_type,
+            "strike": strike,
+            "expiry": expiry,
+            "dte": dte,
+            "premium": premium,
+            "is_sweep": is_sweep,
+            "side": side,
+            "sentiment": sentiment,
+            "underlying_price": underlying_price,
+        }
+        client.table("leap_flow").insert(row).execute()
+        log.info(f"[DB] LEAP flow saved: {ticker} {option_type} ${strike} {dte}DTE ${premium:,.0f}")
+    except Exception as e:
+        log.error(f"[DB] Failed to save LEAP flow for {ticker}: {e}")
+
+
+def get_leap_accumulation(lookback_days: int = 5) -> dict:
+    """Get LEAP flow accumulation per ticker for the last N days.
+
+    Returns dict[ticker] -> {prints, total_premium, bull_premium, bear_premium, sweep_count}
+    """
+    client = _get_client()
+    if not client:
+        return {}
+    try:
+        from datetime import datetime, timedelta
+        cutoff = (datetime.now() - timedelta(days=lookback_days)).isoformat()
+        resp = client.table("leap_flow").select("*").gte("created_at", cutoff).execute()
+
+        accumulation = {}
+        for row in resp.data:
+            ticker = row["ticker"]
+            if ticker not in accumulation:
+                accumulation[ticker] = {
+                    "prints": [],
+                    "total_premium": 0,
+                    "bull_premium": 0,
+                    "bear_premium": 0,
+                    "sweep_count": 0,
+                }
+            acc = accumulation[ticker]
+            acc["prints"].append(row)
+            acc["total_premium"] += float(row["premium"])
+            if row.get("sentiment") == "BULL":
+                acc["bull_premium"] += float(row["premium"])
+            elif row.get("sentiment") == "BEAR":
+                acc["bear_premium"] += float(row["premium"])
+            if row.get("is_sweep"):
+                acc["sweep_count"] += 1
+        return accumulation
+    except Exception as e:
+        log.error(f"[DB] Failed to get LEAP accumulation: {e}")
+        return {}
+
+
+def has_recent_leap_signal(ticker: str, hours: int = 48) -> bool:
+    """Check if a LEAP signal was already fired for this ticker within the last N hours."""
+    client = _get_client()
+    if not client:
+        return False
+    try:
+        from datetime import datetime, timedelta
+        cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
+        resp = (client.table("signals")
+                .select("id")
+                .eq("ticker", ticker)
+                .eq("mode", "leap")
+                .gte("created_at", cutoff)
+                .limit(1)
+                .execute())
+        return len(resp.data) > 0
+    except Exception as e:
+        log.error(f"[DB] Failed to check recent LEAP signal for {ticker}: {e}")
+        return False
+
+
 def _serialize_result(result) -> dict:
     """Convert StrategyResult to a JSON-safe dict."""
     try:
