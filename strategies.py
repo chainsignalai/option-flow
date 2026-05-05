@@ -1953,8 +1953,8 @@ def send_leap_telegram_alert(ticker: str, leap_prints: list,
     sweep_count = sum(1 for p in leap_prints if p.get("is_sweep"))
 
     bull_prem = sum(float(p.get("premium", 0)) for p in leap_prints if p.get("sentiment") == "BULL")
-    bear_prem = total_premium - bull_prem
-    direction = "BULLISH" if bull_prem > bear_prem else "BEARISH"
+    bear_prem = sum(float(p.get("premium", 0)) for p in leap_prints if p.get("sentiment") == "BEAR")
+    direction = result.direction.value
 
     option_type = "CALL" if direction == "BULLISH" else "PUT"
     strike = trade_plan.suggested_strike

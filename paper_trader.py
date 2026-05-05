@@ -406,10 +406,19 @@ def _check_pending_order(tc, pos: PaperPosition, now: datetime):
                             StockLatestQuoteRequest(symbol_or_symbols=[pos.ticker]))
                         stock_quote = sq.get(pos.ticker)
                         if stock_quote:
-                            pos.underlying_entry = (
-                                float(stock_quote.bid_price) + float(stock_quote.ask_price)) / 2
-                            log.info("[PAPER] %s: Updated LEAP underlying_entry to $%.2f on fill",
-                                     pos.ticker, pos.underlying_entry)
+                            bid = float(stock_quote.bid_price or 0)
+                            ask = float(stock_quote.ask_price or 0)
+                            if bid > 0 and ask > 0:
+                                pos.underlying_entry = (bid + ask) / 2
+                            elif bid > 0 or ask > 0:
+                                pos.underlying_entry = max(bid, ask)
+                            else:
+                                log.warning("[PAPER] %s: Zero stock quotes on fill — keeping original underlying_entry $%.2f",
+                                            pos.ticker, pos.underlying_entry)
+                                bid = None
+                            if bid is not None:
+                                log.info("[PAPER] %s: Updated LEAP underlying_entry to $%.2f on fill",
+                                         pos.ticker, pos.underlying_entry)
                 except Exception as e:
                     log.error("[PAPER] %s: Failed to update underlying on fill: %s", pos.ticker, e)
             log.info("[PAPER] %s: FILLED @ $%.2f", pos.ticker, avg_price)
