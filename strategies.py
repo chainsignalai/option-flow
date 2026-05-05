@@ -3046,11 +3046,14 @@ class LiveMonitor:
         bid_prem = _float(payload.get("total_bid_side_prem"))
         side = "ASK" if ask_prem > bid_prem else "BID" if bid_prem > ask_prem else "MID"
 
-        is_bullish = (
-            (option_type == "CALL" and side == "ASK") or
-            (option_type == "PUT" and side == "BID")
-        )
-        sentiment = "BULL" if is_bullish else "BEAR"
+        if side == "MID":
+            sentiment = "NEUTRAL"
+        else:
+            is_bullish = (
+                (option_type == "CALL" and side == "ASK") or
+                (option_type == "PUT" and side == "BID")
+            )
+            sentiment = "BULL" if is_bullish else "BEAR"
 
         sweep_label = "SWEEP" if is_sweep else "BLOCK"
         log.info(

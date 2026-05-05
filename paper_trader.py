@@ -141,8 +141,10 @@ def _load_positions():
 
 
 def _save_positions():
-    with open(POSITIONS_FILE, "w") as f:
+    tmp = POSITIONS_FILE + ".tmp"
+    with open(tmp, "w") as f:
         json.dump([asdict(p) for p in _positions], f, indent=2)
+    os.replace(tmp, POSITIONS_FILE)
 
 
 def get_open_positions() -> list[PaperPosition]:
@@ -370,9 +372,31 @@ def check_and_manage_positions():
 
 
 def _check_pending_order(tc, pos: PaperPosition, now: datetime):
-    """Check if a pending order has been filled, cancelled, etc."""
+    """Check if a pending order has been filled, cancelled, or gone stale."""
     if not pos.order_id:
         return
+
+    max_pending_hours = 48 if pos.strategy_type == "LEAP" else 24
+    if pos.opened_at:
+        age_hours = (now - datetime.fromisoformat(pos.opened_at)).total_seconds() / 3600
+        if age_hours > max_pending_hours:
+            try:
+                tc.cancel_order_by_id(pos.order_id)
+                log.info("[PAPER] %s: Cancelled stale %s order (pending %.0fh > %dh limit)",
+                         pos.ticker, pos.strategy_type, age_hours, max_pending_hours)
+            except Exception as e:
+                log.error("[PAPER] %s: Failed to cancel stale order: %s", pos.ticker, e)
+            pos.status = "CLOSED"
+            pos.close_reason = f"order expired ({age_hours:.0f}h pending)"
+            pos.closed_at = now.isoformat()
+            log_paper_event(
+                pos.order_id, pos.ticker, "ORDER_EXPIRED",
+                direction=pos.direction, option_type=pos.option_type,
+                strike=pos.strike, expiry=pos.expiry,
+                close_reason=pos.close_reason,
+            )
+            return
+
     try:
         order = tc.get_order_by_id(pos.order_id)
         status = str(order.status).lower()
@@ -473,8 +497,12 @@ def _close_position(tc, pos: PaperPosition, current_price: float, reason: str):
     try:
         tc.close_position(symbol_or_asset_id=pos.occ_symbol)
     except Exception as e:
-        log.error("[PAPER] Failed to close %s via Alpaca: %s", pos.ticker, e)
-        return
+        err_str = str(e).lower()
+        if "not found" in err_str or "404" in err_str or "no position" in err_str:
+            log.warning("[PAPER] %s: Position already gone on Alpaca — marking closed locally", pos.ticker)
+        else:
+            log.error("[PAPER] Failed to close %s via Alpaca: %s", pos.ticker, e)
+            return
 
     pos.status = "CLOSED"
     pos.close_reason = reason
