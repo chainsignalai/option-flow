@@ -3124,6 +3124,10 @@ class LiveMonitor:
         await asyncio.sleep(60)
         while self._running:
             try:
+                self._leap_alerted = {
+                    t for t in self._leap_alerted
+                    if persistence.has_recent_leap_signal(t, hours=48)
+                }
                 await asyncio.to_thread(self._check_leap_candidates)
             except Exception as e:
                 log.error(f"[LEAP] Scan loop error: {e}")

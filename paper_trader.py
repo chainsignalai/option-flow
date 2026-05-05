@@ -383,6 +383,21 @@ def _check_pending_order(tc, pos: PaperPosition, now: datetime):
             pos.filled_price = avg_price
             pos.filled_at = now.isoformat()
             pos.peak_premium = avg_price
+            if pos.strategy_type == "LEAP":
+                try:
+                    from alpaca.data.requests import StockLatestQuoteRequest
+                    sdc = _get_stock_data_client()
+                    if sdc:
+                        sq = sdc.get_stock_latest_quote(
+                            StockLatestQuoteRequest(symbol_or_symbols=[pos.ticker]))
+                        stock_quote = sq.get(pos.ticker)
+                        if stock_quote:
+                            pos.underlying_entry = (
+                                float(stock_quote.bid_price) + float(stock_quote.ask_price)) / 2
+                            log.info("[PAPER] %s: Updated LEAP underlying_entry to $%.2f on fill",
+                                     pos.ticker, pos.underlying_entry)
+                except Exception as e:
+                    log.error("[PAPER] %s: Failed to update underlying on fill: %s", pos.ticker, e)
             log.info("[PAPER] %s: FILLED @ $%.2f", pos.ticker, avg_price)
             log_paper_event(
                 pos.order_id, pos.ticker, "FILL",
@@ -459,6 +474,7 @@ def _close_position(tc, pos: PaperPosition, current_price: float, reason: str):
         tc.close_position(symbol_or_asset_id=pos.occ_symbol)
     except Exception as e:
         log.error("[PAPER] Failed to close %s via Alpaca: %s", pos.ticker, e)
+        return
 
     pos.status = "CLOSED"
     pos.close_reason = reason
