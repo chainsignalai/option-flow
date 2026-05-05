@@ -2779,12 +2779,21 @@ class LiveMonitor:
         self._market_tide: dict = {}
         self._gex_cache: dict[str, dict] = {}
         self._regime_cache: tuple = ("", "NEUTRAL")
+        self._last_contradiction_check: dict[str, datetime] = {}
+        self._contradiction_cooldown_minutes = 15
         # LEAP accumulation tracking
         self._leap_alerted: set[str] = set()
         self._leap_min_premium = 100_000
         self._leap_min_dte = 180
         self._leap_accumulation_threshold = 300_000
         self._leap_min_prints = 2
+
+    def _holds_position(self, ticker: str) -> bool:
+        try:
+            from paper_trader import get_open_positions
+            return any(p.ticker == ticker for p in get_open_positions())
+        except Exception:
+            return False
 
     def _should_analyze(self, ticker: str, premium: float) -> bool:
         if ticker in ETF_BLACKLIST:
@@ -2811,6 +2820,13 @@ class LiveMonitor:
             result = self._apply_live_enhancements(result, ticker)
             result.trade_plan = compute_trade_plan(result, regime=self._regime_cache[1])
             print_report(result)
+
+            if self.paper_trade:
+                try:
+                    from paper_trader import check_flow_contradiction
+                    check_flow_contradiction(result, min_conviction=self.min_conviction)
+                except Exception as e:
+                    log.error(f"[LIVE] Flow contradiction check failed for {ticker}: {e}")
 
             r_level = self._conviction_order.index(result.conviction)
             min_level = self._conviction_order.index(self.min_conviction)
@@ -2862,7 +2878,13 @@ class LiveMonitor:
 
         # --- Swing analysis path ---
         if not self._should_analyze(ticker, premium):
-            return
+            if not (self.paper_trade and premium >= self.min_premium
+                    and self._holds_position(ticker)):
+                return
+            last_contra = self._last_contradiction_check.get(ticker)
+            if last_contra and (datetime.now() - last_contra).total_seconds() < self._contradiction_cooldown_minutes * 60:
+                return
+            self._last_contradiction_check[ticker] = datetime.now()
 
         is_sweep = payload.get("has_sweep", False)
         vol_oi_ratio = _float(payload.get("volume_oi_ratio"))

@@ -528,8 +528,97 @@ def _get_current_option_price(pos: PaperPosition) -> Optional[float]:
     return _get_option_mid_price(pos.occ_symbol)
 
 
+def check_flow_contradiction(result, min_conviction: str = "MEDIUM"):
+    """Close/cancel held positions when re-analysis contradicts the original thesis.
+
+    Called from LiveMonitor._run_analysis when a qualifying sweep hits a ticker
+    we already hold. Closes on direction flip or conviction collapse.
+    """
+    if not _positions_loaded:
+        _load_positions()
+
+    from strategies import Signal
+
+    held = [p for p in _positions
+            if p.ticker == result.ticker and p.status in ("PENDING", "FILLED")]
+    if not held:
+        return
+
+    conviction_order = ["NONE", "LOW", "MEDIUM", "HIGH", "VERY_HIGH"]
+    new_dir = result.direction
+    new_conv_idx = (conviction_order.index(result.conviction)
+                    if result.conviction in conviction_order else 0)
+    min_conv_idx = (conviction_order.index(min_conviction)
+                    if min_conviction in conviction_order else 2)
+
+    for pos in held:
+        pos_is_bull = pos.direction == "BULLISH"
+
+        direction_flipped = (
+            (pos_is_bull and new_dir == Signal.BEARISH)
+            or (not pos_is_bull and new_dir == Signal.BULLISH)
+        )
+        conviction_collapsed = new_conv_idx < min_conv_idx
+
+        if not direction_flipped and not conviction_collapsed:
+            log.info(
+                "[PAPER] %s: Re-analysis still supports %s position "
+                "(new direction=%s, conviction=%s, score=%.0f)",
+                pos.ticker, pos.direction, new_dir.value,
+                result.conviction, result.composite_score,
+            )
+            continue
+
+        if direction_flipped:
+            reason = (f"flow contradiction: {pos.direction} → {new_dir.value} "
+                      f"(score={result.composite_score:.0f}, conviction={result.conviction})")
+        else:
+            reason = (f"conviction collapsed: {result.conviction} "
+                      f"(score={result.composite_score:.0f}, direction={new_dir.value})")
+
+        tc = _get_trading_client()
+        if not tc:
+            return
+
+        if pos.status == "PENDING":
+            try:
+                tc.cancel_order_by_id(pos.order_id)
+                pos.status = "CLOSED"
+                pos.close_reason = reason
+                pos.closed_at = datetime.now().isoformat()
+                log.info("[PAPER] %s: Cancelled PENDING order — %s", pos.ticker, reason)
+                log_paper_event(
+                    pos.order_id, pos.ticker, "FLOW_CONTRADICTION",
+                    direction=pos.direction, option_type=pos.option_type,
+                    strike=pos.strike, expiry=pos.expiry,
+                    close_reason=reason,
+                    metadata={"new_direction": new_dir.value,
+                              "new_conviction": result.conviction,
+                              "new_score": result.composite_score},
+                )
+                _send_paper_telegram(
+                    f"⚠️ <b>FLOW CONTRADICTION — ORDER CANCELLED</b>\n"
+                    f"{pos.ticker} {pos.option_type} ${pos.strike:.0f} exp {pos.expiry}\n"
+                    f"{reason}"
+                )
+            except Exception as e:
+                log.error("[PAPER] %s: Failed to cancel on contradiction: %s", pos.ticker, e)
+            continue
+
+        current_price = _get_current_option_price(pos)
+        if current_price is None:
+            log.warning("[PAPER] %s: Cannot get price for contradiction close", pos.ticker)
+            continue
+
+        _close_position(tc, pos, current_price, reason)
+
+    _save_positions()
+
+
 def _reason_to_event_type(reason: str) -> str:
     r = reason.lower()
+    if "flow contradiction" in r or "conviction collapsed" in r:
+        return "FLOW_CONTRADICTION"
     if "profit target" in r:
         return "TP_HIT"
     if "hard stop" in r:
