@@ -163,10 +163,10 @@ def log_paper_event(position_id: str, ticker: str, event_type: str, **kwargs):
 
 def load_paper_positions() -> list[dict] | None:
     """Load active paper positions from Supabase (PENDING + FILLED only).
-    Returns None on error (caller should retry), empty list on success with no positions."""
+    Returns None on transient error (caller should retry), empty list when no client or no positions."""
     client = _get_client()
     if not client:
-        return None
+        return []
     try:
         resp = (client.table("paper_positions")
                 .select("*")
