@@ -419,7 +419,7 @@ def _check_pending_order(tc, pos: PaperPosition, now: datetime):
 
     try:
         order = tc.get_order_by_id(pos.order_id)
-        status = str(order.status).lower()
+        status = getattr(order.status, "value", str(order.status)).lower()
 
         if status == "filled":
             avg_price = float(order.filled_avg_price) if order.filled_avg_price else pos.limit_price
@@ -747,3 +747,95 @@ def get_portfolio_summary() -> dict:
         "avg_loss": sum(losses) / len(losses) if losses else 0,
         "total_pnl": sum(closed_pnls),
     }
+
+
+_trade_stream = None
+
+
+async def _handle_trade_update(data):
+    """Process a real-time trade update from Alpaca's trading stream."""
+    try:
+        event = getattr(data, "event", None) or data.get("event", "")
+        order_obj = getattr(data, "order", None) or data.get("order", {})
+        order_id = str(getattr(order_obj, "id", "") or order_obj.get("id", ""))
+        if not order_id:
+            return
+
+        if not _positions_loaded:
+            _load_positions()
+
+        pos = next((p for p in _positions if p.order_id == order_id), None)
+        if not pos:
+            return
+
+        now = datetime.now()
+
+        if event == "fill":
+            avg_price = float(getattr(order_obj, "filled_avg_price", 0) or
+                              order_obj.get("filled_avg_price", 0) or pos.limit_price)
+            pos.status = "FILLED"
+            pos.filled_price = avg_price
+            pos.filled_at = now.isoformat()
+            pos.peak_premium = avg_price
+            if pos.strategy_type == "LEAP":
+                try:
+                    from alpaca.data.requests import StockLatestQuoteRequest
+                    sdc = _get_stock_data_client()
+                    if sdc:
+                        sq = sdc.get_stock_latest_quote(
+                            StockLatestQuoteRequest(symbol_or_symbols=[pos.ticker]))
+                        stock_quote = sq.get(pos.ticker)
+                        if stock_quote:
+                            bid = float(stock_quote.bid_price or 0)
+                            ask = float(stock_quote.ask_price or 0)
+                            if bid > 0 and ask > 0:
+                                pos.underlying_entry = (bid + ask) / 2
+                            elif bid > 0 or ask > 0:
+                                pos.underlying_entry = max(bid, ask)
+                except Exception as e:
+                    log.error("[PAPER] %s: Failed to update underlying on fill: %s", pos.ticker, e)
+            log.info("[PAPER] %s: FILLED @ $%.2f (real-time)", pos.ticker, avg_price)
+            log_paper_event(
+                pos.order_id, pos.ticker, "FILL",
+                direction=pos.direction, option_type=pos.option_type,
+                strike=pos.strike, expiry=pos.expiry,
+                filled_price=avg_price, price=avg_price,
+            )
+            _send_paper_telegram(
+                f"✅ <b>PAPER FILL</b>\n"
+                f"{pos.ticker} {pos.option_type} ${pos.strike:.0f} exp {pos.expiry}\n"
+                f"Filled @ ${avg_price:.2f}"
+            )
+            _save_positions()
+
+        elif event in ("canceled", "cancelled", "expired", "rejected"):
+            pos.status = "CLOSED"
+            pos.close_reason = event
+            pos.closed_at = now.isoformat()
+            log.info("[PAPER] %s: Order %s (real-time)", pos.ticker, event.upper())
+            log_paper_event(
+                pos.order_id, pos.ticker, f"ORDER_{event.upper()}",
+                direction=pos.direction, option_type=pos.option_type,
+                strike=pos.strike, expiry=pos.expiry,
+                close_reason=event,
+            )
+            _save_positions()
+
+    except Exception as e:
+        log.error("[PAPER] Trade stream event error: %s", e)
+
+
+async def start_trade_stream():
+    """Start Alpaca's real-time trading stream for instant fill detection."""
+    global _trade_stream
+    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+        log.warning("[PAPER] No Alpaca credentials — trade stream disabled")
+        return
+    try:
+        from alpaca.trading.stream import TradingStream
+        _trade_stream = TradingStream(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
+        _trade_stream.subscribe_trade_updates(_handle_trade_update)
+        log.info("[PAPER] 🔴 Real-time trade stream starting")
+        await _trade_stream._run_forever()
+    except Exception as e:
+        log.error("[PAPER] Trade stream error: %s", e)

@@ -45,6 +45,11 @@ ETF_BLACKLIST = {
     "SPY", "QQQ", "IWM", "DIA", "SPX", "XSP", "SPXW", "VIX",
     "UVXY", "SQQQ", "TQQQ", "XLF", "XLE", "XLK", "GLD",
     "SLV", "TLT", "HYG", "EEM", "ARKK", "KWEB",
+    "SMH", "SOXX", "SOXL", "SOXS", "USO", "UNG", "XLP", "XLV",
+    "XLI", "XLU", "XLY", "XLC", "XLRE", "XBI", "IBB", "VXX",
+    "SPXS", "UPRO", "SDS", "SSO", "QLD", "PSQ", "SH", "VIXY",
+    "FXI", "IEMG", "VWO", "EFA", "AGG", "LQD", "JNK", "IEF",
+    "GOVT", "BND", "BITO", "GBTC", "ETHE",
 }
 
 logging.basicConfig(
@@ -1960,6 +1965,14 @@ def send_leap_telegram_alert(ticker: str, leap_prints: list,
     strike = trade_plan.suggested_strike
     expiry = trade_plan.suggested_expiry
 
+    fs = result.flow.signal
+    if fs == Signal.NEUTRAL or result.direction == Signal.NEUTRAL:
+        leap_flow_state = "NEUTRAL"
+    elif fs != result.direction:
+        leap_flow_state = "CONTRADICTS (historically strongest)"
+    else:
+        leap_flow_state = "ALIGNED"
+
     msg = (
         f"🔭 <b>LEAP SIGNAL</b>\n\n"
         f"<b>{ticker}</b> — {direction}\n"
@@ -1970,7 +1983,8 @@ def send_leap_telegram_alert(ticker: str, leap_prints: list,
         f"📈 <b>Analysis</b>\n"
         f"• Conviction: {result.conviction} | Score: {result.composite_score:.0f}/100\n"
         f"• Layers aligned: {result.layers_aligned}/4\n"
-        f"• Flow: {result.flow.signal.value} | Tech: {result.technicals.signal.value}\n\n"
+        f"• Flow: {result.flow.signal.value} | Tech: {result.technicals.signal.value}\n"
+        f"• ⚡ Flow State: {leap_flow_state}\n\n"
         f"🎯 <b>LEAP Plan</b>\n"
         f"• Entry: ${trade_plan.entry_price:.2f}\n"
         f"• Underlying stop: ${trade_plan.stop_price:.2f} (-{trade_plan.stop_pct:.0f}%)\n"
@@ -2629,6 +2643,19 @@ def format_telegram_message(result: StrategyResult) -> str:
         f"7. Social     {result.social.score:5.1f} {de(result.social.signal, '')}  Mentions={result.social.mentions_24h} ({result.social.mentions_change_pct:+.0f}%)  WSB#{result.social.wsb_rank or 'N/A'}",
     ]
 
+    flow_sig = result.flow.signal
+    if flow_sig == Signal.NEUTRAL or result.direction == Signal.NEUTRAL:
+        flow_state = "NEUTRAL"
+        flow_note = ""
+    elif flow_sig != result.direction:
+        flow_state = "CONTRADICTS"
+        flow_note = " (historically strongest)"
+    else:
+        flow_state = "ALIGNED"
+        flow_note = ""
+    lines.append(f"")
+    lines.append(f"⚡ <b>Flow State:</b> {flow_state}{flow_note}")
+
     if result.live_enhancements:
         lines.append(f"\n{'─'*30}")
         lines.append(f"<b>LIVE SIGNALS</b>")
@@ -3185,6 +3212,16 @@ class LiveMonitor:
             except Exception as e:
                 log.error(f"[LIVE] Paper position check error: {e}")
 
+    async def _trade_stream_loop(self):
+        from paper_trader import start_trade_stream
+        while self._running:
+            try:
+                log.info("[LIVE] 🔴 Starting Alpaca real-time trade stream")
+                await start_trade_stream()
+            except Exception as e:
+                log.error(f"[LIVE] Trade stream error (reconnecting in 5s): {e}")
+                await asyncio.sleep(5)
+
     async def run(self):
         try:
             import websockets
@@ -3225,6 +3262,7 @@ class LiveMonitor:
 
         if self.paper_trade:
             asyncio.ensure_future(self._paper_position_loop())
+            asyncio.ensure_future(self._trade_stream_loop())
 
         asyncio.ensure_future(self._leap_scan_loop())
         log.info("[LIVE] 🔭 LEAP scan loop started (checks every 30min)")
