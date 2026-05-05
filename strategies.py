@@ -3222,6 +3222,16 @@ class LiveMonitor:
                 log.error(f"[LIVE] Trade stream error (reconnecting in 5s): {e}")
                 await asyncio.sleep(5)
 
+    async def _option_stream_loop(self):
+        from paper_trader import start_option_stream
+        while self._running:
+            try:
+                log.info("[LIVE] 📊 Starting real-time option quote stream")
+                await start_option_stream()
+            except Exception as e:
+                log.error(f"[LIVE] Option stream error (reconnecting in 5s): {e}")
+                await asyncio.sleep(5)
+
     async def run(self):
         try:
             import websockets
@@ -3263,6 +3273,7 @@ class LiveMonitor:
         if self.paper_trade:
             asyncio.ensure_future(self._paper_position_loop())
             asyncio.ensure_future(self._trade_stream_loop())
+            asyncio.ensure_future(self._option_stream_loop())
 
         asyncio.ensure_future(self._leap_scan_loop())
         log.info("[LIVE] 🔭 LEAP scan loop started (checks every 30min)")

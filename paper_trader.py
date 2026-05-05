@@ -7,6 +7,7 @@ trailing stop, theta kill).
 from __future__ import annotations
 
 import os
+import asyncio
 import logging
 from datetime import datetime
 from dataclasses import dataclass, asdict
@@ -750,14 +751,23 @@ def get_portfolio_summary() -> dict:
 
 
 _trade_stream = None
+_option_stream = None
+_subscribed_symbols: set[str] = set()
+
+
+def _sync_save():
+    """Thread-safe save — called from async handlers via run_in_executor."""
+    _save_positions()
 
 
 async def _handle_trade_update(data):
     """Process a real-time trade update from Alpaca's trading stream."""
     try:
-        event = getattr(data, "event", None) or data.get("event", "")
-        order_obj = getattr(data, "order", None) or data.get("order", {})
-        order_id = str(getattr(order_obj, "id", "") or order_obj.get("id", ""))
+        event = str(getattr(data, "event", "") or "")
+        order_obj = getattr(data, "order", None)
+        if not order_obj:
+            return
+        order_id = str(getattr(order_obj, "id", "") or "")
         if not order_id:
             return
 
@@ -769,10 +779,11 @@ async def _handle_trade_update(data):
             return
 
         now = datetime.now()
+        loop = asyncio.get_event_loop()
 
         if event == "fill":
-            avg_price = float(getattr(order_obj, "filled_avg_price", 0) or
-                              order_obj.get("filled_avg_price", 0) or pos.limit_price)
+            raw_price = getattr(order_obj, "filled_avg_price", None)
+            avg_price = float(raw_price) if raw_price else pos.limit_price
             pos.status = "FILLED"
             pos.filled_price = avg_price
             pos.filled_at = now.isoformat()
@@ -782,8 +793,9 @@ async def _handle_trade_update(data):
                     from alpaca.data.requests import StockLatestQuoteRequest
                     sdc = _get_stock_data_client()
                     if sdc:
-                        sq = sdc.get_stock_latest_quote(
-                            StockLatestQuoteRequest(symbol_or_symbols=[pos.ticker]))
+                        sq = await loop.run_in_executor(
+                            None, lambda: sdc.get_stock_latest_quote(
+                                StockLatestQuoteRequest(symbol_or_symbols=[pos.ticker])))
                         stock_quote = sq.get(pos.ticker)
                         if stock_quote:
                             bid = float(stock_quote.bid_price or 0)
@@ -795,34 +807,186 @@ async def _handle_trade_update(data):
                 except Exception as e:
                     log.error("[PAPER] %s: Failed to update underlying on fill: %s", pos.ticker, e)
             log.info("[PAPER] %s: FILLED @ $%.2f (real-time)", pos.ticker, avg_price)
-            log_paper_event(
+            await loop.run_in_executor(None, lambda: log_paper_event(
                 pos.order_id, pos.ticker, "FILL",
                 direction=pos.direction, option_type=pos.option_type,
                 strike=pos.strike, expiry=pos.expiry,
                 filled_price=avg_price, price=avg_price,
-            )
-            _send_paper_telegram(
+            ))
+            await loop.run_in_executor(None, lambda: _send_paper_telegram(
                 f"✅ <b>PAPER FILL</b>\n"
                 f"{pos.ticker} {pos.option_type} ${pos.strike:.0f} exp {pos.expiry}\n"
                 f"Filled @ ${avg_price:.2f}"
-            )
-            _save_positions()
+            ))
+            await loop.run_in_executor(None, _sync_save)
+            await _subscribe_option_quotes([pos.occ_symbol])
 
-        elif event in ("canceled", "cancelled", "expired", "rejected"):
+        elif event in ("canceled", "expired", "rejected"):
             pos.status = "CLOSED"
             pos.close_reason = event
             pos.closed_at = now.isoformat()
             log.info("[PAPER] %s: Order %s (real-time)", pos.ticker, event.upper())
-            log_paper_event(
+            await loop.run_in_executor(None, lambda: log_paper_event(
                 pos.order_id, pos.ticker, f"ORDER_{event.upper()}",
                 direction=pos.direction, option_type=pos.option_type,
                 strike=pos.strike, expiry=pos.expiry,
                 close_reason=event,
-            )
-            _save_positions()
+            ))
+            await loop.run_in_executor(None, _sync_save)
 
     except Exception as e:
         log.error("[PAPER] Trade stream event error: %s", e)
+
+
+async def _handle_option_quote(data):
+    """Process real-time option quote — run exit checks instantly."""
+    try:
+        symbol = str(getattr(data, "symbol", "") or "")
+        if not symbol:
+            return
+
+        bid = float(getattr(data, "bid_price", 0) or 0)
+        ask = float(getattr(data, "ask_price", 0) or 0)
+        if bid <= 0 and ask <= 0:
+            return
+        current_price = round((bid + ask) / 2, 2) if (bid > 0 and ask > 0) else max(bid, ask)
+
+        if not _positions_loaded:
+            _load_positions()
+
+        pos = next((p for p in _positions
+                     if p.occ_symbol == symbol and p.status == "FILLED" and p.filled_price),
+                    None)
+        if not pos:
+            return
+
+        entry = pos.filled_price
+        pnl_pct = (current_price - entry) / entry * 100
+
+        if pos.peak_premium is None or current_price > pos.peak_premium:
+            pos.peak_premium = current_price
+
+        tc = _get_trading_client()
+        if not tc:
+            return
+
+        now = datetime.now()
+        loop = asyncio.get_event_loop()
+
+        if pnl_pct <= pos.premium_stop_pct:
+            await loop.run_in_executor(
+                None, lambda: _close_position(tc, pos, current_price, f"hard stop ({pnl_pct:+.1f}%)"))
+            await loop.run_in_executor(None, _sync_save)
+            await _unsubscribe_option_quotes([symbol])
+            return
+
+        if pos.strategy_type == "LEAP" and pos.underlying_entry > 0:
+            try:
+                from alpaca.data.requests import StockLatestQuoteRequest
+                sdc = _get_stock_data_client()
+                if sdc:
+                    sq = await loop.run_in_executor(
+                        None, lambda: sdc.get_stock_latest_quote(
+                            StockLatestQuoteRequest(symbol_or_symbols=[pos.ticker])))
+                    stock_quote = sq.get(pos.ticker)
+                    if stock_quote:
+                        sbid = float(stock_quote.bid_price or 0)
+                        sask = float(stock_quote.ask_price or 0)
+                        if sbid > 0 or sask > 0:
+                            stock_price = (sbid + sask) / 2 if (sbid > 0 and sask > 0) else max(sbid, sask)
+                            stock_move_pct = (stock_price - pos.underlying_entry) / pos.underlying_entry * 100
+                            is_bull = pos.direction == "BULLISH"
+                            if (is_bull and stock_move_pct <= -25) or (not is_bull and stock_move_pct >= 25):
+                                await loop.run_in_executor(
+                                    None, lambda: _close_position(
+                                        tc, pos, current_price,
+                                        f"underlying stop ({pos.ticker} {stock_move_pct:+.1f}% "
+                                        f"from ${pos.underlying_entry:.2f})"))
+                                await loop.run_in_executor(None, _sync_save)
+                                await _unsubscribe_option_quotes([symbol])
+                                return
+            except Exception as e:
+                log.error("[PAPER] LEAP underlying check failed for %s: %s", pos.ticker, e)
+
+        if pnl_pct >= pos.premium_target_pct:
+            await loop.run_in_executor(
+                None, lambda: _close_position(tc, pos, current_price, f"profit target ({pnl_pct:+.1f}%)"))
+            await loop.run_in_executor(None, _sync_save)
+            await _unsubscribe_option_quotes([symbol])
+            return
+
+        if pnl_pct >= pos.trail_activate_pct and not pos.trail_active:
+            pos.trail_active = True
+            await loop.run_in_executor(None, lambda: log_paper_event(
+                pos.order_id, pos.ticker, "TRAIL_ACTIVATED",
+                direction=pos.direction, option_type=pos.option_type,
+                strike=pos.strike, expiry=pos.expiry,
+                price=current_price, filled_price=pos.filled_price,
+                pnl_pct=round(pnl_pct, 2), peak_premium=pos.peak_premium,
+                trail_active=True,
+            ))
+
+        if pos.trail_active and pos.peak_premium:
+            drawdown_from_peak = (pos.peak_premium - current_price) / pos.peak_premium * 100
+            if drawdown_from_peak >= pos.trail_stop_pct:
+                await loop.run_in_executor(
+                    None, lambda: _close_position(
+                        tc, pos, current_price,
+                        f"trailing stop (peak=${pos.peak_premium:.2f}, drawdown={drawdown_from_peak:.1f}%)"))
+                await loop.run_in_executor(None, _sync_save)
+                await _unsubscribe_option_quotes([symbol])
+                return
+
+        hold_start = pos.filled_at or pos.opened_at
+        if hold_start:
+            days_held = (now - datetime.fromisoformat(hold_start)).days
+            if days_held >= pos.theta_kill_days and abs(pnl_pct) < pos.theta_kill_move_pct:
+                await loop.run_in_executor(
+                    None, lambda: _close_position(
+                        tc, pos, current_price,
+                        f"theta kill (day {days_held}, move={pnl_pct:+.1f}%)"))
+                await loop.run_in_executor(None, _sync_save)
+                await _unsubscribe_option_quotes([symbol])
+                return
+            if days_held >= pos.max_hold_days:
+                await loop.run_in_executor(
+                    None, lambda: _close_position(tc, pos, current_price, f"max hold ({days_held}d)"))
+                await loop.run_in_executor(None, _sync_save)
+                await _unsubscribe_option_quotes([symbol])
+                return
+
+    except Exception as e:
+        log.error("[PAPER] Option quote handler error for %s: %s",
+                  getattr(data, "symbol", "?"), e)
+
+
+async def _subscribe_option_quotes(symbols: list[str]):
+    """Subscribe to real-time quotes for option symbols."""
+    global _option_stream
+    if not _option_stream or not symbols:
+        return
+    new_syms = [s for s in symbols if s not in _subscribed_symbols]
+    if not new_syms:
+        return
+    try:
+        _option_stream.subscribe_quotes(_handle_option_quote, *new_syms)
+        _subscribed_symbols.update(new_syms)
+        log.info("[PAPER] Subscribed to real-time quotes: %s", ", ".join(new_syms))
+    except Exception as e:
+        log.error("[PAPER] Failed to subscribe option quotes: %s", e)
+
+
+async def _unsubscribe_option_quotes(symbols: list[str]):
+    """Unsubscribe from closed position quotes."""
+    global _option_stream
+    if not _option_stream or not symbols:
+        return
+    try:
+        _option_stream.unsubscribe_quotes(*symbols)
+        _subscribed_symbols.discard(symbols[0]) if len(symbols) == 1 else _subscribed_symbols.difference_update(symbols)
+        log.info("[PAPER] Unsubscribed from quotes: %s", ", ".join(symbols))
+    except Exception as e:
+        log.error("[PAPER] Failed to unsubscribe option quotes: %s", e)
 
 
 async def start_trade_stream():
@@ -839,3 +1003,28 @@ async def start_trade_stream():
         await _trade_stream._run_forever()
     except Exception as e:
         log.error("[PAPER] Trade stream error: %s", e)
+
+
+async def start_option_stream():
+    """Start real-time option quote stream for instant exit management."""
+    global _option_stream
+    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+        log.warning("[PAPER] No Alpaca credentials — option stream disabled")
+        return
+    try:
+        from alpaca.data.live.option import OptionDataStream
+        _option_stream = OptionDataStream(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+
+        if not _positions_loaded:
+            _load_positions()
+        filled_symbols = [p.occ_symbol for p in _positions if p.status == "FILLED" and p.filled_price]
+        if filled_symbols:
+            _option_stream.subscribe_quotes(_handle_option_quote, *filled_symbols)
+            _subscribed_symbols.update(filled_symbols)
+            log.info("[PAPER] Subscribed to %d option quote streams: %s",
+                     len(filled_symbols), ", ".join(filled_symbols))
+
+        log.info("[PAPER] 📊 Real-time option quote stream starting")
+        await _option_stream._run_forever()
+    except Exception as e:
+        log.error("[PAPER] Option stream error: %s", e)
