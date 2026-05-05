@@ -2881,6 +2881,7 @@ class LiveMonitor:
                 pass
 
         # --- Swing analysis path ---
+        is_contradiction_bypass = False
         if not self._should_analyze(ticker, premium):
             if not (self.paper_trade and premium >= self.min_premium
                     and self._holds_position(ticker)):
@@ -2888,7 +2889,7 @@ class LiveMonitor:
             last_contra = self._last_contradiction_check.get(ticker)
             if last_contra and (datetime.now() - last_contra).total_seconds() < self._contradiction_cooldown_minutes * 60:
                 return
-            self._last_contradiction_check[ticker] = datetime.now()
+            is_contradiction_bypass = True
 
         is_sweep = payload.get("has_sweep", False)
         vol_oi_ratio = _float(payload.get("volume_oi_ratio"))
@@ -2897,6 +2898,9 @@ class LiveMonitor:
             return
         if payload.get("volume_oi_ratio") is not None and vol_oi_ratio <= 1.0:
             return
+
+        if is_contradiction_bypass:
+            self._last_contradiction_check[ticker] = datetime.now()
 
         option_type = str(payload.get("type", "")).upper()
         ask_prem = _float(payload.get("total_ask_side_prem"))
