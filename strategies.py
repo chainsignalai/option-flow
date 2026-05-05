@@ -1845,7 +1845,7 @@ def compute_trade_plan(result: StrategyResult, regime: str = None) -> TradePlan:
     tp.premium_target_pct = round(tp.target_pct * tp.option_leverage, 0)
     tp.premium_target_pct = max(20, min(tp.premium_target_pct, 200))
     tp.premium_stop_pct = -40.0
-    tp.trail_activate_pct = round(tp.premium_target_pct * 0.6, 0)
+    tp.trail_activate_pct = round(min(tp.premium_target_pct * 0.6, 40.0), 0)
     tp.trail_stop_pct = 20.0
 
     log.info(
@@ -2790,8 +2790,12 @@ class LiveMonitor:
 
     def _holds_position(self, ticker: str) -> bool:
         try:
-            from paper_trader import get_open_positions
-            return any(p.ticker == ticker for p in get_open_positions())
+            from paper_trader import get_open_positions, SAME_COMPANY_TICKERS
+            match_tickers = {ticker}
+            alt = SAME_COMPANY_TICKERS.get(ticker)
+            if alt:
+                match_tickers.add(alt)
+            return any(p.ticker in match_tickers for p in get_open_positions())
         except Exception:
             return False
 

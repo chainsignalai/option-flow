@@ -96,6 +96,25 @@ def _get_alpaca_tickers(tc) -> set[str]:
     return tickers
 
 
+SAME_COMPANY_TICKERS = {
+    "GOOG": "GOOGL", "GOOGL": "GOOG",
+    "BRK.A": "BRK.B", "BRK.B": "BRK.A",
+    "FOX": "FOXA", "FOXA": "FOX",
+    "LENT": "LENTA", "LENTA": "LENT",
+    "NWS": "NWSA", "NWSA": "NWS",
+    "DISCA": "DISCK", "DISCK": "DISCA",
+}
+
+
+def _has_same_company_position(ticker: str, held_tickers: set[str]) -> bool:
+    if ticker in held_tickers:
+        return True
+    alt = SAME_COMPANY_TICKERS.get(ticker)
+    if alt and alt in held_tickers:
+        return True
+    return False
+
+
 def _send_paper_telegram(message: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -196,7 +215,7 @@ def place_paper_trade(result) -> Optional[PaperPosition]:
         return None
 
     alpaca_tickers = _get_alpaca_tickers(tc)
-    if result.ticker in alpaca_tickers:
+    if _has_same_company_position(result.ticker, alpaca_tickers):
         log.info("[PAPER] %s: Already has open position on Alpaca — skipping duplicate", result.ticker)
         return None
 
@@ -204,7 +223,7 @@ def place_paper_trade(result) -> Optional[PaperPosition]:
         _load_positions()
     open_swing_tickers = {p.ticker for p in _positions
                           if p.status in ("PENDING", "FILLED") and p.strategy_type == "SWING"}
-    if result.ticker in open_swing_tickers:
+    if _has_same_company_position(result.ticker, open_swing_tickers):
         log.info("[PAPER] %s: Already has open swing position in local tracking — skipping duplicate", result.ticker)
         return None
 
@@ -539,8 +558,12 @@ def check_flow_contradiction(result, min_conviction: str = "MEDIUM"):
 
     from strategies import Signal
 
+    match_tickers = {result.ticker}
+    alt = SAME_COMPANY_TICKERS.get(result.ticker)
+    if alt:
+        match_tickers.add(alt)
     held = [p for p in _positions
-            if p.ticker == result.ticker and p.status in ("PENDING", "FILLED")]
+            if p.ticker in match_tickers and p.status in ("PENDING", "FILLED")]
     if not held:
         return
 
@@ -702,7 +725,7 @@ def place_leap_trade(result, trade_plan) -> Optional[PaperPosition]:
         return None
 
     alpaca_tickers = _get_alpaca_tickers(tc)
-    if result.ticker in alpaca_tickers:
+    if _has_same_company_position(result.ticker, alpaca_tickers):
         log.info("[LEAP] %s: Already has open position on Alpaca — skipping duplicate", result.ticker)
         return None
 
@@ -710,7 +733,7 @@ def place_leap_trade(result, trade_plan) -> Optional[PaperPosition]:
         _load_positions()
     open_leap_tickers = {p.ticker for p in _positions
                          if p.status in ("PENDING", "FILLED") and p.strategy_type == "LEAP"}
-    if result.ticker in open_leap_tickers:
+    if _has_same_company_position(result.ticker, open_leap_tickers):
         log.info("[LEAP] %s: Already has open LEAP position in local tracking — skipping duplicate", result.ticker)
         return None
 
