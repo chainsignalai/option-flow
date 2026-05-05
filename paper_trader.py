@@ -7,14 +7,13 @@ trailing stop, theta kill).
 from __future__ import annotations
 
 import os
-import json
 import logging
 from datetime import datetime
 from dataclasses import dataclass, asdict
 from typing import Optional
 
 from dotenv import load_dotenv
-from db import log_paper_event, load_paper_positions, save_paper_positions
+from db import log_paper_event, load_paper_positions, save_paper_positions, load_closed_paper_positions
 
 import httpx
 
@@ -160,6 +159,9 @@ _positions_loaded: bool = False
 def _load_positions():
     global _positions, _positions_loaded
     data = load_paper_positions()
+    if data is None:
+        log.warning("[PAPER] Supabase load failed — will retry next cycle")
+        return
     known_fields = set(PaperPosition.__dataclass_fields__)
     _positions = [PaperPosition(**{k: v for k, v in row.items() if k in known_fields}) for row in data]
     _positions_loaded = True
@@ -730,17 +732,18 @@ def get_portfolio_summary() -> dict:
         _load_positions()
 
     open_pos = [p for p in _positions if p.status == "FILLED"]
-    closed = [p for p in _positions if p.status == "CLOSED" and p.pnl_pct is not None]
-    wins = [p for p in closed if p.pnl_pct > 0]
-    losses = [p for p in closed if p.pnl_pct <= 0]
+    closed_rows = load_closed_paper_positions()
+    closed_pnls = [float(r["pnl_pct"]) for r in closed_rows]
+    wins = [p for p in closed_pnls if p > 0]
+    losses = [p for p in closed_pnls if p <= 0]
 
     return {
         "open_positions": len(open_pos),
-        "total_closed": len(closed),
+        "total_closed": len(closed_pnls),
         "wins": len(wins),
         "losses": len(losses),
-        "win_rate": len(wins) / len(closed) * 100 if closed else 0,
-        "avg_win": sum(p.pnl_pct for p in wins) / len(wins) if wins else 0,
-        "avg_loss": sum(p.pnl_pct for p in losses) / len(losses) if losses else 0,
-        "total_pnl": sum(p.pnl_pct for p in closed),
+        "win_rate": len(wins) / len(closed_pnls) * 100 if closed_pnls else 0,
+        "avg_win": sum(wins) / len(wins) if wins else 0,
+        "avg_loss": sum(losses) / len(losses) if losses else 0,
+        "total_pnl": sum(closed_pnls),
     }

@@ -161,18 +161,22 @@ def log_paper_event(position_id: str, ticker: str, event_type: str, **kwargs):
         log.error(f"[DB] Failed to log paper event for {ticker}: {e}")
 
 
-def load_paper_positions() -> list[dict]:
-    """Load all paper positions from Supabase."""
+def load_paper_positions() -> list[dict] | None:
+    """Load active paper positions from Supabase (PENDING + FILLED only).
+    Returns None on error (caller should retry), empty list on success with no positions."""
     client = _get_client()
     if not client:
-        return []
+        return None
     try:
-        resp = client.table("paper_positions").select("*").execute()
-        log.info(f"[DB] Loaded {len(resp.data)} paper positions from Supabase")
+        resp = (client.table("paper_positions")
+                .select("*")
+                .in_("status", ["PENDING", "FILLED"])
+                .execute())
+        log.info(f"[DB] Loaded {len(resp.data)} active paper positions from Supabase")
         return resp.data
     except Exception as e:
         log.error(f"[DB] Failed to load paper positions: {e}")
-        return []
+        return None
 
 
 def save_paper_positions(positions: list[dict]):
@@ -188,6 +192,22 @@ def save_paper_positions(positions: list[dict]):
         log.debug(f"[DB] Upserted {len(rows)} paper positions to Supabase")
     except Exception as e:
         log.error(f"[DB] Failed to save paper positions: {e}")
+
+
+def load_closed_paper_positions() -> list[dict]:
+    """Load closed paper positions from Supabase (for portfolio summary)."""
+    client = _get_client()
+    if not client:
+        return []
+    try:
+        resp = (client.table("paper_positions")
+                .select("pnl_pct")
+                .eq("status", "CLOSED")
+                .execute())
+        return [r for r in resp.data if r.get("pnl_pct") is not None]
+    except Exception as e:
+        log.error(f"[DB] Failed to load closed paper positions: {e}")
+        return []
 
 
 def save_leap_flow(ticker: str, option_type: str, strike: float, expiry: str,
