@@ -3077,26 +3077,29 @@ class LiveMonitor:
         log.info(f"[LEAP] {'='*50}")
 
         try:
-            bull_prem = sum(float(p.get("premium", 0)) for p in leap_prints
-                           if p.get("sentiment") == "BULL")
-            bear_prem = sum(float(p.get("premium", 0)) for p in leap_prints
-                           if p.get("sentiment") == "BEAR")
-            leap_direction = Signal.BULLISH if bull_prem > bear_prem else Signal.BEARISH
-
             today = datetime.now().strftime("%Y-%m-%d")
             if self._regime_cache[0] != today:
                 self._regime_cache = (today, get_current_regime())
             regime = self._regime_cache[1]
+
+            if regime == "NEUTRAL":
+                log.info(f"[LEAP] {ticker}: NEUTRAL regime — skipping LEAP (no API calls)")
+                return
+
+            bull_prem = sum(float(p.get("premium", 0)) for p in leap_prints
+                           if p.get("sentiment") == "BULL")
+            bear_prem = sum(float(p.get("premium", 0)) for p in leap_prints
+                           if p.get("sentiment") == "BEAR")
+            if bull_prem == bear_prem:
+                log.info(f"[LEAP] {ticker}: Equal bull/bear premium — no directional edge, skipping")
+                return
+            leap_direction = Signal.BULLISH if bull_prem > bear_prem else Signal.BEARISH
 
             result = analyze_ticker(ticker, regime=regime)
 
             result.direction = leap_direction
             log.info(f"[LEAP] {ticker}: Direction set to {leap_direction.value} "
                      f"(from LEAP flow: bull=${bull_prem:,.0f} bear=${bear_prem:,.0f})")
-
-            if regime == "NEUTRAL":
-                log.info(f"[LEAP] {ticker}: NEUTRAL regime — skipping LEAP")
-                return
 
             trade_plan = compute_leap_trade_plan(result, leap_prints)
             if not trade_plan:

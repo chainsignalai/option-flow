@@ -188,8 +188,13 @@ def place_paper_trade(result) -> Optional[PaperPosition]:
 
     occ_symbol = _build_occ_symbol(result.ticker, expiry, option_type, strike)
 
-    estimated_premium = tp.entry_price * (tp.target_pct / 100) / tp.option_leverage
-    limit_price = round(max(estimated_premium, 0.50), 2)
+    mid_price = _get_option_mid_price(occ_symbol)
+    if mid_price and mid_price > 0:
+        limit_price = mid_price
+    else:
+        limit_price = round(max(tp.entry_price * (tp.target_pct / 100) / tp.option_leverage, 0.50), 2)
+        log.warning("[PAPER] %s: Could not get market price for %s — using estimate $%.2f",
+                    result.ticker, occ_symbol, limit_price)
 
     pos = PaperPosition(
         ticker=result.ticker,
@@ -353,7 +358,8 @@ def check_and_manage_positions():
                                     f"drawdown={drawdown_from_peak:.1f}%)")
                     continue
 
-            days_held = (now - datetime.fromisoformat(pos.opened_at)).days
+            hold_start = pos.filled_at or pos.opened_at
+            days_held = (now - datetime.fromisoformat(hold_start)).days
             if days_held >= pos.theta_kill_days:
                 underlying_move = abs(pnl_pct)
                 if underlying_move < pos.theta_kill_move_pct:
@@ -375,27 +381,6 @@ def _check_pending_order(tc, pos: PaperPosition, now: datetime):
     """Check if a pending order has been filled, cancelled, or gone stale."""
     if not pos.order_id:
         return
-
-    max_pending_hours = 48 if pos.strategy_type == "LEAP" else 24
-    if pos.opened_at:
-        age_hours = (now - datetime.fromisoformat(pos.opened_at)).total_seconds() / 3600
-        if age_hours > max_pending_hours:
-            try:
-                tc.cancel_order_by_id(pos.order_id)
-                log.info("[PAPER] %s: Cancelled stale %s order (pending %.0fh > %dh limit)",
-                         pos.ticker, pos.strategy_type, age_hours, max_pending_hours)
-            except Exception as e:
-                log.error("[PAPER] %s: Failed to cancel stale order: %s", pos.ticker, e)
-            pos.status = "CLOSED"
-            pos.close_reason = f"order expired ({age_hours:.0f}h pending)"
-            pos.closed_at = now.isoformat()
-            log_paper_event(
-                pos.order_id, pos.ticker, "ORDER_EXPIRED",
-                direction=pos.direction, option_type=pos.option_type,
-                strike=pos.strike, expiry=pos.expiry,
-                close_reason=pos.close_reason,
-            )
-            return
 
     try:
         order = tc.get_order_by_id(pos.order_id)
@@ -445,6 +430,26 @@ def _check_pending_order(tc, pos: PaperPosition, now: datetime):
                 strike=pos.strike, expiry=pos.expiry,
                 close_reason=status,
             )
+        elif status in ("new", "accepted", "partially_filled", "pending_new"):
+            max_pending_hours = 48 if pos.strategy_type == "LEAP" else 24
+            if pos.opened_at:
+                age_hours = (now - datetime.fromisoformat(pos.opened_at)).total_seconds() / 3600
+                if age_hours > max_pending_hours:
+                    try:
+                        tc.cancel_order_by_id(pos.order_id)
+                        log.info("[PAPER] %s: Cancelled stale %s order (pending %.0fh > %dh limit)",
+                                 pos.ticker, pos.strategy_type, age_hours, max_pending_hours)
+                    except Exception as e:
+                        log.error("[PAPER] %s: Failed to cancel stale order: %s", pos.ticker, e)
+                    pos.status = "CLOSED"
+                    pos.close_reason = f"order expired ({age_hours:.0f}h pending)"
+                    pos.closed_at = now.isoformat()
+                    log_paper_event(
+                        pos.order_id, pos.ticker, "ORDER_EXPIRED",
+                        direction=pos.direction, option_type=pos.option_type,
+                        strike=pos.strike, expiry=pos.expiry,
+                        close_reason=pos.close_reason,
+                    )
     except Exception as e:
         log.error("[PAPER] Failed to check order for %s: %s", pos.ticker, e)
 
