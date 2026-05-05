@@ -1866,21 +1866,38 @@ def compute_leap_trade_plan(result: StrategyResult, leap_prints: list) -> Option
 
     is_bull = result.direction == Signal.BULLISH
 
-    best_print = max(leap_prints, key=lambda p: float(p.get("premium", 0)))
+    want_type = "CALL" if is_bull else "PUT"
+    matching_prints = [p for p in leap_prints
+                       if str(p.get("option_type", "")).upper() == want_type]
+    if not matching_prints:
+        matching_prints = leap_prints
+
+    best_print = max(matching_prints, key=lambda p: float(p.get("premium", 0)))
     tp.suggested_strike = float(best_print["strike"])
     tp.suggested_expiry = str(best_print.get("expiry", ""))[:10]
     dte = int(best_print.get("dte", 365))
     tp.suggested_dte = f"{dte} DTE"
 
-    otm_pct = abs(tp.suggested_strike - price) / price if price else 0
-    if otm_pct <= 0.05:
-        tp.suggested_delta = 0.55
-    elif otm_pct <= 0.15:
-        tp.suggested_delta = 0.35
-    elif otm_pct <= 0.30:
-        tp.suggested_delta = 0.20
+    strike_dist = (tp.suggested_strike - price) / price if price else 0
+    is_itm = (is_bull and strike_dist < 0) or (not is_bull and strike_dist > 0)
+    abs_dist = abs(strike_dist)
+
+    if is_itm:
+        if abs_dist >= 0.15:
+            tp.suggested_delta = 0.90
+        elif abs_dist >= 0.05:
+            tp.suggested_delta = 0.70
+        else:
+            tp.suggested_delta = 0.55
     else:
-        tp.suggested_delta = 0.10
+        if abs_dist <= 0.05:
+            tp.suggested_delta = 0.50
+        elif abs_dist <= 0.15:
+            tp.suggested_delta = 0.35
+        elif abs_dist <= 0.30:
+            tp.suggested_delta = 0.20
+        else:
+            tp.suggested_delta = 0.10
     tp.option_leverage = round(1 / tp.suggested_delta, 1) if tp.suggested_delta > 0 else 5.0
 
     tp.premium_target_pct = 99999.0
@@ -1913,9 +1930,10 @@ def compute_leap_trade_plan(result: StrategyResult, leap_prints: list) -> Option
         f"{best_print.get('option_type', '')} at ${tp.suggested_strike:.0f}"
     )
 
+    moneyness = "ITM" if is_itm else "OTM"
     log.info(
         f"[LEAP] {result.ticker}: Plan — {tp.suggested_dte} | "
-        f"Strike=${tp.suggested_strike:.0f} ({otm_pct:.0%} OTM) | "
+        f"Strike=${tp.suggested_strike:.0f} ({abs_dist:.0%} {moneyness}) | "
         f"Stop=${tp.stop_price:.2f} (-{tp.stop_pct:.0f}%) | "
         f"No fixed TP | Trail +{tp.trail_activate_pct:.0f}%/{tp.trail_stop_pct:.0f}% | "
         f"Prem stop={tp.premium_stop_pct:.0f}%"

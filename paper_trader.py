@@ -30,6 +30,7 @@ ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
 
 _trading_client = None
 _data_client = None
+_stock_data_client = None
 
 
 def _get_trading_client():
@@ -54,6 +55,17 @@ def _get_data_client():
     from alpaca.data.historical.option import OptionHistoricalDataClient
     _data_client = OptionHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
     return _data_client
+
+
+def _get_stock_data_client():
+    global _stock_data_client
+    if _stock_data_client is not None:
+        return _stock_data_client
+    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+        return None
+    from alpaca.data.historical.stock import StockHistoricalDataClient
+    _stock_data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+    return _stock_data_client
 
 
 def _send_paper_telegram(message: str):
@@ -300,8 +312,9 @@ def check_and_manage_positions():
             if pos.strategy_type == "LEAP" and pos.underlying_entry > 0:
                 try:
                     from alpaca.data.requests import StockLatestQuoteRequest
-                    from alpaca.data.historical.stock import StockHistoricalDataClient
-                    sdc = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+                    sdc = _get_stock_data_client()
+                    if not sdc:
+                        raise RuntimeError("Stock data client unavailable")
                     sq = sdc.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=[pos.ticker]))
                     stock_quote = sq.get(pos.ticker)
                     if stock_quote:
@@ -435,6 +448,8 @@ def _reason_to_event_type(reason: str) -> str:
         return "THETA_KILL"
     if "max hold" in r:
         return "MAX_HOLD"
+    if "underlying stop" in r:
+        return "UNDERLYING_STOP"
     return "CLOSED"
 
 
