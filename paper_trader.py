@@ -692,11 +692,13 @@ def _close_position(tc, pos: PaperPosition, current_price: float, reason: str):
         trail_active=pos.trail_active, close_reason=reason,
     )
     pnl_emoji = "🟢" if pos.pnl_pct and pos.pnl_pct > 0 else "🔴"
+    entry_str = f"${pos.filled_price:.2f}" if pos.filled_price is not None else "N/A"
+    pnl_str = f"{pos.pnl_pct:+.1f}%" if pos.pnl_pct is not None else "?%"
     _send_paper_telegram(
         f"{pnl_emoji} <b>PAPER TRADE CLOSED</b>\n"
         f"{pos.ticker} {pos.option_type} ${pos.strike:.0f} exp {pos.expiry}\n"
-        f"Entry: ${pos.filled_price:.2f} → Exit: ${current_price:.2f}\n"
-        f"PnL: {pos.pnl_pct:+.1f}% | Reason: {reason}"
+        f"Entry: {entry_str} → Exit: ${current_price:.2f}\n"
+        f"PnL: {pnl_str} | Reason: {reason}"
     )
 
 
