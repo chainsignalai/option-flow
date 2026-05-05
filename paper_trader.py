@@ -325,14 +325,19 @@ def check_and_manage_positions():
                     sq = sdc.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=[pos.ticker]))
                     stock_quote = sq.get(pos.ticker)
                     if stock_quote:
-                        stock_price = (float(stock_quote.bid_price) + float(stock_quote.ask_price)) / 2
-                        stock_move_pct = (stock_price - pos.underlying_entry) / pos.underlying_entry * 100
-                        is_bull = pos.direction == "BULLISH"
-                        if (is_bull and stock_move_pct <= -25) or (not is_bull and stock_move_pct >= 25):
-                            _close_position(tc, pos, current_price,
-                                            f"underlying stop ({pos.ticker} {stock_move_pct:+.1f}% "
-                                            f"from ${pos.underlying_entry:.2f})")
-                            continue
+                        bid = float(stock_quote.bid_price or 0)
+                        ask = float(stock_quote.ask_price or 0)
+                        if bid <= 0 and ask <= 0:
+                            log.debug("[PAPER] %s: No valid stock quote — skipping underlying check", pos.ticker)
+                        else:
+                            stock_price = (bid + ask) / 2 if (bid > 0 and ask > 0) else max(bid, ask)
+                            stock_move_pct = (stock_price - pos.underlying_entry) / pos.underlying_entry * 100
+                            is_bull = pos.direction == "BULLISH"
+                            if (is_bull and stock_move_pct <= -25) or (not is_bull and stock_move_pct >= 25):
+                                _close_position(tc, pos, current_price,
+                                                f"underlying stop ({pos.ticker} {stock_move_pct:+.1f}% "
+                                                f"from ${pos.underlying_entry:.2f})")
+                                continue
                 except Exception as e:
                     log.error("[PAPER] LEAP underlying check failed for %s: %s", pos.ticker, e)
 
@@ -439,17 +444,18 @@ def _check_pending_order(tc, pos: PaperPosition, now: datetime):
                         tc.cancel_order_by_id(pos.order_id)
                         log.info("[PAPER] %s: Cancelled stale %s order (pending %.0fh > %dh limit)",
                                  pos.ticker, pos.strategy_type, age_hours, max_pending_hours)
+                        pos.status = "CLOSED"
+                        pos.close_reason = f"order expired ({age_hours:.0f}h pending)"
+                        pos.closed_at = now.isoformat()
+                        log_paper_event(
+                            pos.order_id, pos.ticker, "ORDER_EXPIRED",
+                            direction=pos.direction, option_type=pos.option_type,
+                            strike=pos.strike, expiry=pos.expiry,
+                            close_reason=pos.close_reason,
+                        )
                     except Exception as e:
-                        log.error("[PAPER] %s: Failed to cancel stale order: %s", pos.ticker, e)
-                    pos.status = "CLOSED"
-                    pos.close_reason = f"order expired ({age_hours:.0f}h pending)"
-                    pos.closed_at = now.isoformat()
-                    log_paper_event(
-                        pos.order_id, pos.ticker, "ORDER_EXPIRED",
-                        direction=pos.direction, option_type=pos.option_type,
-                        strike=pos.strike, expiry=pos.expiry,
-                        close_reason=pos.close_reason,
-                    )
+                        log.error("[PAPER] %s: Failed to cancel stale order, will retry: %s",
+                                  pos.ticker, e)
     except Exception as e:
         log.error("[PAPER] Failed to check order for %s: %s", pos.ticker, e)
 
