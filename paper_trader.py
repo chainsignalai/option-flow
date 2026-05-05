@@ -297,6 +297,25 @@ def check_and_manage_positions():
                 _close_position(tc, pos, current_price, f"hard stop ({pnl_pct:+.1f}%)")
                 continue
 
+            if pos.strategy_type == "LEAP" and pos.underlying_entry > 0:
+                try:
+                    from alpaca.data.requests import StockLatestQuoteRequest
+                    from alpaca.data.historical.stock import StockHistoricalDataClient
+                    sdc = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+                    sq = sdc.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=[pos.ticker]))
+                    stock_quote = sq.get(pos.ticker)
+                    if stock_quote:
+                        stock_price = (float(stock_quote.bid_price) + float(stock_quote.ask_price)) / 2
+                        stock_move_pct = (stock_price - pos.underlying_entry) / pos.underlying_entry * 100
+                        is_bull = pos.direction == "BULLISH"
+                        if (is_bull and stock_move_pct <= -25) or (not is_bull and stock_move_pct >= 25):
+                            _close_position(tc, pos, current_price,
+                                            f"underlying stop ({pos.ticker} {stock_move_pct:+.1f}% "
+                                            f"from ${pos.underlying_entry:.2f})")
+                            continue
+                except Exception as e:
+                    log.error("[PAPER] LEAP underlying check failed for %s: %s", pos.ticker, e)
+
             if pnl_pct >= pos.premium_target_pct:
                 _close_position(tc, pos, current_price, f"profit target ({pnl_pct:+.1f}%)")
                 continue
@@ -507,7 +526,8 @@ def place_leap_trade(result, trade_plan) -> Optional[PaperPosition]:
             )
             return None
     except Exception as e:
-        log.error("[LEAP] %s: Could not check allocation: %s", result.ticker, e)
+        log.error("[LEAP] %s: Could not check allocation — skipping: %s", result.ticker, e)
+        return None
 
     pos = PaperPosition(
         ticker=result.ticker,
@@ -519,7 +539,7 @@ def place_leap_trade(result, trade_plan) -> Optional[PaperPosition]:
         limit_price=mid_price,
         occ_symbol=occ_symbol,
         strategy_type="LEAP",
-        premium_target_pct=trade_plan.premium_target_pct or 200.0,
+        premium_target_pct=trade_plan.premium_target_pct or 99999.0,
         premium_stop_pct=trade_plan.premium_stop_pct,
         trail_activate_pct=trade_plan.trail_activate_pct or 100.0,
         trail_stop_pct=trade_plan.trail_stop_pct,
