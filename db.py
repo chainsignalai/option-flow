@@ -161,6 +161,35 @@ def log_paper_event(position_id: str, ticker: str, event_type: str, **kwargs):
         log.error(f"[DB] Failed to log paper event for {ticker}: {e}")
 
 
+def load_paper_positions() -> list[dict]:
+    """Load all paper positions from Supabase."""
+    client = _get_client()
+    if not client:
+        return []
+    try:
+        resp = client.table("paper_positions").select("*").execute()
+        log.info(f"[DB] Loaded {len(resp.data)} paper positions from Supabase")
+        return resp.data
+    except Exception as e:
+        log.error(f"[DB] Failed to load paper positions: {e}")
+        return []
+
+
+def save_paper_positions(positions: list[dict]):
+    """Upsert all paper positions to Supabase."""
+    client = _get_client()
+    if not client:
+        return
+    rows = [p for p in positions if p.get("order_id")]
+    if not rows:
+        return
+    try:
+        client.table("paper_positions").upsert(rows, on_conflict="order_id").execute()
+        log.debug(f"[DB] Upserted {len(rows)} paper positions to Supabase")
+    except Exception as e:
+        log.error(f"[DB] Failed to save paper positions: {e}")
+
+
 def save_leap_flow(ticker: str, option_type: str, strike: float, expiry: str,
                    dte: int, premium: float, is_sweep: bool, side: str,
                    sentiment: str, underlying_price: float):

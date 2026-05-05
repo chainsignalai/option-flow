@@ -14,7 +14,7 @@ from dataclasses import dataclass, asdict
 from typing import Optional
 
 from dotenv import load_dotenv
-from db import log_paper_event
+from db import log_paper_event, load_paper_positions, save_paper_positions
 
 import httpx
 
@@ -66,6 +66,34 @@ def _get_stock_data_client():
     from alpaca.data.historical.stock import StockHistoricalDataClient
     _stock_data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
     return _stock_data_client
+
+
+def _get_alpaca_tickers(tc) -> set[str]:
+    """Get tickers with open positions or pending orders on Alpaca (source of truth for dedup)."""
+    tickers = set()
+    try:
+        positions = tc.get_all_positions()
+        for p in positions:
+            sym = p.symbol
+            for i, ch in enumerate(sym):
+                if ch.isdigit():
+                    tickers.add(sym[:i])
+                    break
+    except Exception as e:
+        log.error("[PAPER] Failed to get Alpaca positions for dedup: %s", e)
+    try:
+        from alpaca.trading.requests import GetOrdersRequest
+        from alpaca.trading.enums import QueryOrderStatus
+        orders = tc.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN))
+        for o in orders:
+            sym = o.symbol
+            for i, ch in enumerate(sym):
+                if ch.isdigit():
+                    tickers.add(sym[:i])
+                    break
+    except Exception as e:
+        log.error("[PAPER] Failed to get Alpaca open orders for dedup: %s", e)
+    return tickers
 
 
 def _send_paper_telegram(message: str):
@@ -125,30 +153,25 @@ class PaperPosition:
     strategy_type: str = "SWING"
 
 
-POSITIONS_FILE = os.path.join(os.path.dirname(__file__), "paper_positions.json")
 _positions: list[PaperPosition] = []
+_positions_loaded: bool = False
 
 
 def _load_positions():
-    global _positions
-    try:
-        with open(POSITIONS_FILE, "r") as f:
-            data = json.load(f)
-            _positions = [PaperPosition(**p) for p in data]
-            log.info("[PAPER] Loaded %d positions from disk", len(_positions))
-    except (FileNotFoundError, json.JSONDecodeError):
-        _positions = []
+    global _positions, _positions_loaded
+    data = load_paper_positions()
+    known_fields = set(PaperPosition.__dataclass_fields__)
+    _positions = [PaperPosition(**{k: v for k, v in row.items() if k in known_fields}) for row in data]
+    _positions_loaded = True
 
 
 def _save_positions():
-    tmp = POSITIONS_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump([asdict(p) for p in _positions], f, indent=2)
-    os.replace(tmp, POSITIONS_FILE)
+    rows = [asdict(p) for p in _positions if p.order_id]
+    save_paper_positions(rows)
 
 
 def get_open_positions() -> list[PaperPosition]:
-    if not _positions:
+    if not _positions_loaded:
         _load_positions()
     return [p for p in _positions if p.status in ("PENDING", "FILLED")]
 
@@ -169,12 +192,17 @@ def place_paper_trade(result) -> Optional[PaperPosition]:
     if result.direction == Signal.NEUTRAL:
         return None
 
-    if not _positions:
+    alpaca_tickers = _get_alpaca_tickers(tc)
+    if result.ticker in alpaca_tickers:
+        log.info("[PAPER] %s: Already has open position on Alpaca — skipping duplicate", result.ticker)
+        return None
+
+    if not _positions_loaded:
         _load_positions()
     open_swing_tickers = {p.ticker for p in _positions
                           if p.status in ("PENDING", "FILLED") and p.strategy_type == "SWING"}
     if result.ticker in open_swing_tickers:
-        log.info("[PAPER] %s: Already has open swing position — skipping duplicate", result.ticker)
+        log.info("[PAPER] %s: Already has open swing position in local tracking — skipping duplicate", result.ticker)
         return None
 
     is_bull = result.direction == Signal.BULLISH
@@ -271,7 +299,7 @@ def place_paper_trade(result) -> Optional[PaperPosition]:
             close_reason=str(e),
         )
 
-    if not _positions:
+    if not _positions_loaded:
         _load_positions()
     _positions.append(pos)
     _save_positions()
@@ -284,7 +312,7 @@ def check_and_manage_positions():
     if not tc:
         return
 
-    if not _positions:
+    if not _positions_loaded:
         _load_positions()
 
     open_positions = [p for p in _positions if p.status in ("PENDING", "FILLED")]
@@ -579,12 +607,17 @@ def place_leap_trade(result, trade_plan) -> Optional[PaperPosition]:
         log.warning("[LEAP] %s: Could not get option price for %s — skipping", result.ticker, occ_symbol)
         return None
 
-    if not _positions:
+    alpaca_tickers = _get_alpaca_tickers(tc)
+    if result.ticker in alpaca_tickers:
+        log.info("[LEAP] %s: Already has open position on Alpaca — skipping duplicate", result.ticker)
+        return None
+
+    if not _positions_loaded:
         _load_positions()
     open_leap_tickers = {p.ticker for p in _positions
                          if p.status in ("PENDING", "FILLED") and p.strategy_type == "LEAP"}
     if result.ticker in open_leap_tickers:
-        log.info("[LEAP] %s: Already has open LEAP position — skipping duplicate", result.ticker)
+        log.info("[LEAP] %s: Already has open LEAP position in local tracking — skipping duplicate", result.ticker)
         return None
 
     MAX_LEAP_ALLOCATION = 0.20
@@ -684,7 +717,7 @@ def place_leap_trade(result, trade_plan) -> Optional[PaperPosition]:
             close_reason=str(e),
         )
 
-    if not _positions:
+    if not _positions_loaded:
         _load_positions()
     _positions.append(pos)
     _save_positions()
@@ -693,7 +726,7 @@ def place_leap_trade(result, trade_plan) -> Optional[PaperPosition]:
 
 def get_portfolio_summary() -> dict:
     """Return summary stats for all paper positions."""
-    if not _positions:
+    if not _positions_loaded:
         _load_positions()
 
     open_pos = [p for p in _positions if p.status == "FILLED"]
