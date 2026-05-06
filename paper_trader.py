@@ -184,6 +184,9 @@ def _load_positions():
         return
     known_fields = set(PaperPosition.__dataclass_fields__)
     _positions = [PaperPosition(**{k: v for k, v in row.items() if k in known_fields}) for row in data]
+    for pos in _positions:
+        if pos.strategy_type != "LEAP" and pos.trail_activate_pct > 40.0:
+            pos.trail_activate_pct = 40.0
     _positions_loaded = True
 
 
