@@ -163,6 +163,7 @@ class PaperPosition:
     theta_kill_move_pct: float = 10.0
     underlying_entry: float = 0.0
     peak_premium: Optional[float] = None
+    trough_premium: Optional[float] = None
     trail_active: bool = False
     opened_at: str = ""
     closed_at: str = ""
@@ -364,6 +365,8 @@ def check_and_manage_positions():
 
             if pos.peak_premium is None or current_price > pos.peak_premium:
                 pos.peak_premium = current_price
+            if pos.trough_premium is None or current_price < pos.trough_premium:
+                pos.trough_premium = current_price
 
             if pnl_pct <= pos.premium_stop_pct:
                 _close_position(tc, pos, current_price, f"hard stop ({pnl_pct:+.1f}%)")
@@ -984,6 +987,8 @@ async def _handle_option_quote(data):
 
         if pos.peak_premium is None or current_price > pos.peak_premium:
             pos.peak_premium = current_price
+        if pos.trough_premium is None or current_price < pos.trough_premium:
+            pos.trough_premium = current_price
 
         tc = _get_trading_client()
         if not tc:
