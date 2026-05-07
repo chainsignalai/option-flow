@@ -2902,6 +2902,16 @@ class LiveMonitor:
         if payload.get("volume_oi_ratio") is not None and vol_oi_ratio <= 1.0:
             return
 
+        # Skip swing analysis for LEAP-only flow (DTE >= 180) — let LEAP scanner handle it
+        if not is_contradiction_bypass and expiry_str:
+            try:
+                alert_dte = (datetime.strptime(expiry_str[:10], "%Y-%m-%d").date() - datetime.now().date()).days
+                if alert_dte >= 180:
+                    log.info(f"[LIVE] {ticker}: Sweep DTE={alert_dte} is LEAP territory — skipping swing analysis")
+                    return
+            except ValueError:
+                pass
+
         if is_contradiction_bypass:
             self._last_contradiction_check[ticker] = datetime.now()
 
