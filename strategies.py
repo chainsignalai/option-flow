@@ -2848,13 +2848,16 @@ class LiveMonitor:
                 log.info(f"[LIVE] 📱 Telegram alert sent for {ticker} ({result.conviction})")
 
                 if self.paper_trade and result.trade_plan:
-                    try:
-                        from paper_trader import place_paper_trade
-                        pos = place_paper_trade(result)
-                        if pos:
-                            log.info(f"[LIVE] 📄 Paper trade placed for {ticker}: {pos.option_type} ${pos.strike} exp {pos.expiry}")
-                    except Exception as e:
-                        log.error(f"[LIVE] Paper trade failed for {ticker}: {e}")
+                    if result.technicals.score < 50:
+                        log.info(f"[LIVE] {ticker}: Technicals score {result.technicals.score:.0f} < 50 — skipping paper trade")
+                    else:
+                        try:
+                            from paper_trader import place_paper_trade
+                            pos = place_paper_trade(result)
+                            if pos:
+                                log.info(f"[LIVE] 📄 Paper trade placed for {ticker}: {pos.option_type} ${pos.strike} exp {pos.expiry}")
+                        except Exception as e:
+                            log.error(f"[LIVE] Paper trade failed for {ticker}: {e}")
 
             elif self.send_telegram:
                 log.info(f"[LIVE] {ticker}: Conviction {result.conviction} below threshold {self.min_conviction} — no Telegram")
@@ -3170,14 +3173,17 @@ class LiveMonitor:
                 send_leap_telegram_alert(ticker, leap_prints, result, trade_plan)
 
             if self.paper_trade:
-                try:
-                    from paper_trader import place_leap_trade
-                    pos = place_leap_trade(result, trade_plan)
-                    if pos:
-                        log.info(f"[LEAP] 📄 LEAP paper trade placed for {ticker}: "
-                                 f"{pos.option_type} ${pos.strike} exp {pos.expiry}")
-                except Exception as e:
-                    log.error(f"[LEAP] Paper trade failed for {ticker}: {e}")
+                if result.technicals.score < 50:
+                    log.info(f"[LEAP] {ticker}: Technicals score {result.technicals.score:.0f} < 50 — skipping paper trade")
+                else:
+                    try:
+                        from paper_trader import place_leap_trade
+                        pos = place_leap_trade(result, trade_plan)
+                        if pos:
+                            log.info(f"[LEAP] 📄 LEAP paper trade placed for {ticker}: "
+                                     f"{pos.option_type} ${pos.strike} exp {pos.expiry}")
+                    except Exception as e:
+                        log.error(f"[LEAP] Paper trade failed for {ticker}: {e}")
 
         except Exception as e:
             log.error(f"[LEAP] Analysis failed for {ticker}: {e}")
