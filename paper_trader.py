@@ -68,6 +68,35 @@ def _get_stock_data_client():
     return _stock_data_client
 
 
+def _get_spy_daily_return() -> Optional[float]:
+    """Get SPY's intraday return (current price vs previous close)."""
+    try:
+        sdc = _get_stock_data_client()
+        if not sdc:
+            return None
+        from alpaca.data.requests import StockLatestQuoteRequest, StockBarsRequest
+        from alpaca.data.timeframe import TimeFrame
+        quote = sdc.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=["SPY"]))
+        spy_quote = quote.get("SPY")
+        if not spy_quote:
+            return None
+        bid = float(spy_quote.bid_price or 0)
+        ask = float(spy_quote.ask_price or 0)
+        current = (bid + ask) / 2 if (bid > 0 and ask > 0) else max(bid, ask)
+        if current <= 0:
+            return None
+        bars = sdc.get_stock_bars(StockBarsRequest(
+            symbol_or_symbols=["SPY"], timeframe=TimeFrame.Day, limit=2))
+        spy_bars = bars.get("SPY") or bars.data.get("SPY")
+        if spy_bars and len(spy_bars) >= 1:
+            prev_close = float(spy_bars[-1].close)
+            if prev_close > 0:
+                return round((current - prev_close) / prev_close * 100, 2)
+    except Exception as e:
+        log.debug("[PAPER] Failed to get SPY daily return: %s", e)
+    return None
+
+
 def _get_alpaca_tickers(tc) -> set[str]:
     """Get tickers with open positions or pending orders on Alpaca (source of truth for dedup)."""
     tickers = set()
@@ -171,6 +200,7 @@ class PaperPosition:
     close_price: Optional[float] = None
     pnl_pct: Optional[float] = None
     strategy_type: str = "SWING"
+    market_return_pct: Optional[float] = None
 
 
 _positions: list[PaperPosition] = []
@@ -286,6 +316,7 @@ def place_paper_trade(result) -> Optional[PaperPosition]:
         theta_kill_move_pct=tp.theta_kill_move_pct,
         underlying_entry=tp.entry_price,
         opened_at=datetime.now().isoformat(),
+        market_return_pct=_get_spy_daily_return(),
     )
 
     try:
@@ -824,6 +855,7 @@ def place_leap_trade(result, trade_plan) -> Optional[PaperPosition]:
         theta_kill_move_pct=trade_plan.theta_kill_move_pct,
         underlying_entry=trade_plan.entry_price,
         opened_at=datetime.now().isoformat(),
+        market_return_pct=_get_spy_daily_return(),
     )
 
     try:
