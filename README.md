@@ -30,7 +30,7 @@ Unusual Whales WebSocket
 
 ### Entry Criteria
 
-A swing trade must pass 8 gates before execution:
+A swing trade must pass 9 gates before execution:
 
 #### Gate 1 — Flow Trigger (WebSocket, real-time)
 
@@ -129,11 +129,23 @@ Before placing any order:
 
 If the ticker (or a same-company ticker) already has an open swing position → skip.
 
-#### Gate 6 — Technicals Filter
+#### Gate 6 — Position Cap
+
+Total open positions (PENDING + FILLED, all strategies combined) are capped at 8:
+
+| Open Positions | Minimum Conviction |
+|---|---|
+| 1-3 | MEDIUM+ |
+| 4-8 | HIGH+ only |
+| > 8 | **No new trades** |
+
+This forces selectivity and prevents concentration risk from correlated bets.
+
+#### Gate 7 — Technicals Filter
 
 Technicals score must be >= 50 to place a paper trade. Trades with weak technicals (fighting momentum) are still analyzed and alerted via Telegram but do not execute. Based on live data: all 10 winners had technicals = 70, the only sub-50 trade (USO, technicals = 30) lost -$430.
 
-#### Gate 7 — Trade Plan Validation
+#### Gate 8 — Trade Plan Validation
 
 Must have a valid suggested strike and expiry derived from the qualifying flow prints:
 - Correct option type (CALL for bull, PUT for bear)

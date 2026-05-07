@@ -231,6 +231,18 @@ def place_paper_trade(result) -> Optional[PaperPosition]:
         log.info("[PAPER] %s: Already has open swing position in local tracking — skipping duplicate", result.ticker)
         return None
 
+    # Position cap: 1-3 MEDIUM+, 4-8 HIGH+ only, hard cap at 8
+    MAX_POSITIONS = 8
+    HIGH_ONLY_THRESHOLD = 3
+    open_count = sum(1 for p in _positions if p.status in ("PENDING", "FILLED"))
+    if open_count >= MAX_POSITIONS:
+        log.info("[PAPER] %s: At position cap (%d/%d) — skipping", result.ticker, open_count, MAX_POSITIONS)
+        return None
+    if open_count >= HIGH_ONLY_THRESHOLD and result.conviction not in ("HIGH", "VERY_HIGH"):
+        log.info("[PAPER] %s: %d positions open, only HIGH+ allowed (conviction=%s) — skipping",
+                 result.ticker, open_count, result.conviction)
+        return None
+
     is_bull = result.direction == Signal.BULLISH
     option_type = "CALL" if is_bull else "PUT"
 
@@ -743,6 +755,18 @@ def place_leap_trade(result, trade_plan) -> Optional[PaperPosition]:
                          if p.status in ("PENDING", "FILLED") and p.strategy_type == "LEAP"}
     if _has_same_company_position(result.ticker, open_leap_tickers):
         log.info("[LEAP] %s: Already has open LEAP position in local tracking — skipping duplicate", result.ticker)
+        return None
+
+    # Position cap: 1-3 MEDIUM+, 4-8 HIGH+ only, hard cap at 8
+    MAX_POSITIONS = 8
+    HIGH_ONLY_THRESHOLD = 3
+    open_count = sum(1 for p in _positions if p.status in ("PENDING", "FILLED"))
+    if open_count >= MAX_POSITIONS:
+        log.info("[LEAP] %s: At position cap (%d/%d) — skipping", result.ticker, open_count, MAX_POSITIONS)
+        return None
+    if open_count >= HIGH_ONLY_THRESHOLD and result.conviction not in ("HIGH", "VERY_HIGH"):
+        log.info("[LEAP] %s: %d positions open, only HIGH+ allowed (conviction=%s) — skipping",
+                 result.ticker, open_count, result.conviction)
         return None
 
     MAX_LEAP_ALLOCATION = 0.20
