@@ -210,6 +210,24 @@ def load_closed_paper_positions() -> list[dict]:
         return []
 
 
+def load_closed_paper_positions_since(since_iso: str) -> list[dict]:
+    """Load closed paper positions since a given ISO timestamp."""
+    client = _get_client()
+    if not client:
+        return []
+    try:
+        resp = (client.table("paper_positions")
+                .select("ticker,option_type,strike,expiry,filled_price,quantity,pnl_pct,close_reason,closed_at,strategy_type")
+                .eq("status", "CLOSED")
+                .gte("closed_at", since_iso)
+                .order("closed_at")
+                .execute())
+        return resp.data
+    except Exception as e:
+        log.error(f"[DB] Failed to load closed positions since {since_iso}: {e}")
+        return []
+
+
 def save_leap_flow(ticker: str, option_type: str, strike: float, expiry: str,
                    dte: int, premium: float, is_sweep: bool, side: str,
                    sentiment: str, underlying_price: float):

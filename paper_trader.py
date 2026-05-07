@@ -14,7 +14,7 @@ from dataclasses import dataclass, asdict
 from typing import Optional
 
 from dotenv import load_dotenv
-from db import log_paper_event, load_paper_positions, save_paper_positions, load_closed_paper_positions
+from db import log_paper_event, load_paper_positions, save_paper_positions, load_closed_paper_positions, load_closed_paper_positions_since
 
 import httpx
 
@@ -894,6 +894,99 @@ def get_portfolio_summary() -> dict:
         "avg_loss": sum(losses) / len(losses) if losses else 0,
         "total_pnl": sum(closed_pnls),
     }
+
+
+def send_eod_report():
+    """Send end-of-day P&L report via Telegram."""
+    from datetime import timezone, timedelta
+
+    et = timezone(timedelta(hours=-4))
+    now_et = datetime.now(et)
+    today_start = now_et.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+
+    if not _positions_loaded:
+        _load_positions()
+
+    # --- Realized P&L (closed today) ---
+    closed_today = load_closed_paper_positions_since(today_start)
+    closed_today = [c for c in closed_today if c.get("close_reason") not in ("canceled", "cancelled", "expired")]
+
+    realized_lines = []
+    total_realized = 0.0
+    for c in closed_today:
+        fp = c.get("filled_price") or 0
+        pnl_pct = c.get("pnl_pct") or 0
+        qty = c.get("quantity") or 1
+        pnl_dollar = fp * 100 * qty * pnl_pct / 100
+        total_realized += pnl_dollar
+        emoji = "\U0001f7e2" if pnl_pct > 0 else "\U0001f534"
+        reason = (c.get("close_reason") or "")[:35]
+        realized_lines.append(
+            f"  {emoji} {c['ticker']} {c.get('option_type','')} ${c.get('strike',0):.0f} "
+            f"→ {pnl_pct:+.1f}% (${pnl_dollar:+,.0f}) {reason}"
+        )
+
+    # --- Unrealized P&L (open positions) ---
+    open_filled = [p for p in _positions if p.status == "FILLED"]
+    unrealized_lines = []
+    total_unrealized = 0.0
+    for pos in open_filled:
+        current_price = _get_current_option_price(pos)
+        if current_price is None or not pos.filled_price:
+            unrealized_lines.append(f"  ⚪ {pos.ticker} — no quote")
+            continue
+        pnl_pct = (current_price - pos.filled_price) / pos.filled_price * 100
+        pnl_dollar = (current_price - pos.filled_price) * 100 * pos.quantity
+        total_unrealized += pnl_dollar
+        emoji = "\U0001f7e2" if pnl_pct > 0 else "\U0001f534"
+        unrealized_lines.append(
+            f"  {emoji} {pos.ticker} {pos.option_type} ${pos.strike:.0f} "
+            f"→ {pnl_pct:+.1f}% (${pnl_dollar:+,.0f})"
+        )
+
+    # --- Account equity ---
+    equity_line = ""
+    try:
+        tc = _get_trading_client()
+        if tc:
+            acct = tc.get_account()
+            equity = float(acct.equity)
+            equity_line = f"\n\U0001f4b0 Account equity: ${equity:,.0f}"
+    except Exception:
+        pass
+
+    # --- All-time stats ---
+    all_closed = load_closed_paper_positions()
+    all_pnls = [float(r["pnl_pct"]) for r in all_closed]
+    wins = [p for p in all_pnls if p > 0]
+    losses = [p for p in all_pnls if p <= 0]
+    win_rate = len(wins) / len(all_pnls) * 100 if all_pnls else 0
+
+    net = total_realized + total_unrealized
+    net_emoji = "\U0001f7e2" if net >= 0 else "\U0001f534"
+
+    msg = f"\U0001f4ca <b>DAILY P&L REPORT</b> — {now_et.strftime('%b %d, %Y')}\n"
+    msg += f"{'—' * 30}\n"
+
+    if realized_lines:
+        msg += f"\n<b>Realized ({len(closed_today)} closed)</b>\n"
+        msg += "\n".join(realized_lines)
+        msg += f"\n  <b>Subtotal: ${total_realized:+,.0f}</b>\n"
+    else:
+        msg += "\n<b>Realized: no closes today</b>\n"
+
+    msg += f"\n<b>Unrealized ({len(open_filled)} open)</b>\n"
+    msg += "\n".join(unrealized_lines) if unrealized_lines else "  None"
+    msg += f"\n  <b>Subtotal: ${total_unrealized:+,.0f}</b>\n"
+
+    msg += f"\n{'—' * 30}\n"
+    msg += f"{net_emoji} <b>Net today: ${net:+,.0f}</b>"
+    msg += equity_line
+    msg += f"\n\U0001f4c8 All-time: {len(wins)}W / {len(losses)}L ({win_rate:.0f}% win rate)"
+
+    _send_paper_telegram(msg)
+    log.info("[PAPER] EOD report sent — realized=$%+,.0f unrealized=$%+,.0f net=$%+,.0f",
+             total_realized, total_unrealized, net)
 
 
 _trade_stream = None

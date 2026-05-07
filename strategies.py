@@ -3248,6 +3248,24 @@ class LiveMonitor:
             except Exception as e:
                 log.error(f"[LIVE] Paper position check error: {e}")
 
+    async def _eod_report_loop(self):
+        from paper_trader import send_eod_report
+        from datetime import timezone, timedelta
+        et = timezone(timedelta(hours=-4))
+        while self._running:
+            try:
+                now_et = datetime.now(et)
+                target = now_et.replace(hour=16, minute=5, second=0, microsecond=0)
+                if now_et >= target:
+                    target += timedelta(days=1)
+                wait_secs = (target - now_et).total_seconds()
+                log.info(f"[LIVE] EOD report scheduled in {wait_secs/3600:.1f}h ({target.strftime('%H:%M ET')})")
+                await asyncio.sleep(wait_secs)
+                await asyncio.to_thread(send_eod_report)
+            except Exception as e:
+                log.error(f"[LIVE] EOD report error: {e}")
+                await asyncio.sleep(60)
+
     async def _trade_stream_loop(self):
         from paper_trader import start_trade_stream
         while self._running:
@@ -3320,6 +3338,7 @@ class LiveMonitor:
             asyncio.ensure_future(self._paper_position_loop())
             asyncio.ensure_future(self._trade_stream_loop())
             asyncio.ensure_future(self._option_stream_loop())
+            asyncio.ensure_future(self._eod_report_loop())
 
         asyncio.ensure_future(self._leap_scan_loop())
         log.info("[LIVE] 🔭 LEAP scan loop started (checks every 30min)")
