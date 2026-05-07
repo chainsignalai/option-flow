@@ -12,17 +12,27 @@ Unusual Whales WebSocket
         ▼
    Flow Alert arrives
         │
-        ├── SWING path (DTE 6-180)
-        │   └── 7-layer analysis → paper trade
+        ├── DTE >= 180 → LEAP print tracked in Supabase
+        │                  (accumulation scan every 30min → paper trade)
         │
-        └── LEAP path (DTE 180+)
-            └── Accumulation tracking → scan every 30min → paper trade
+        ├── DTE < 180 + sweep + vol>OI → SWING analysis
+        │   └── 7-layer analysis + 9 entry gates → paper trade
+        │
+        └── Existing position held? → Flow contradiction check
+            (closes on direction flip or conviction collapse)
+
+Position Management (dual path):
+   ├── Sync polling (every 120s)
+   └── Real-time option quote streaming (sub-second)
+
+Daily:
+   └── EOD P&L report via Telegram (4:05 PM ET)
 ```
 
-**Data sources**: Unusual Whales (flow, dark pool, GEX, IV, technicals, catalyst), ApeWisdom (social)
+**Data sources**: Unusual Whales (flow, dark pool, GEX, IV, technicals, catalyst, market tide), ApeWisdom (social)
 **Execution**: Alpaca paper trading API
 **Persistence**: Supabase (signals, positions, LEAP flow, trade events)
-**Alerts**: Telegram
+**Alerts**: Telegram (trade entries, exits, daily P&L report)
 
 ---
 
@@ -42,6 +52,7 @@ A flow alert from Unusual Whales must meet ALL of:
 | Premium | >= $100,000 | Filters out retail-sized orders |
 | Sweep | Must be a sweep order | Multi-exchange fill = urgency and conviction |
 | Volume > OI | volume_oi_ratio > 1.0 | New positions opening, not closing |
+| DTE < 180 | Triggering alert must be near-term | LEAP sweeps (180+ DTE) skip swing, handled by LEAP scanner |
 | Cooldown | 5 min since last analysis on this ticker | Prevents redundant API calls |
 
 #### Gate 2 — 7-Layer Analysis
@@ -61,6 +72,8 @@ If the flow qualifies, runs a full analysis across 7 layers:
 **Directional layers** (Flow, GEX, Technicals, Social) vote on BULLISH/BEARISH/NEUTRAL. The side with more votes sets the trade direction.
 
 **Condition layers** (Dark Pool, IV, Catalyst) contribute to the composite score but don't vote on direction. Dark pool measures institutional interest. IV tells you if options are cheap or expensive. Catalyst flags upcoming events.
+
+**TIDE adjustment**: In live mode, the market-wide option flow tide (net call vs put premium) adjusts the composite score by +3 (aligns with direction) or -3 (conflicts). Conviction is re-evaluated after the TIDE adjustment.
 
 ##### Layer 1 — Flow Scoring
 
@@ -143,7 +156,7 @@ This forces selectivity and prevents concentration risk from correlated bets.
 
 #### Gate 7 — Technicals Filter
 
-Technicals score must be >= 50 to place a paper trade. Trades with weak technicals (fighting momentum) are still analyzed and alerted via Telegram but do not execute. Based on live data: all 10 winners had technicals = 70, the only sub-50 trade (USO, technicals = 30) lost -$430.
+Technicals score must be >= 50 to place a paper trade. Trades with weak technicals (fighting momentum) are still analyzed and alerted via Telegram but do not execute.
 
 #### Gate 8 — Trade Plan Validation
 
@@ -166,7 +179,7 @@ AND new analysis conviction >= MEDIUM → CLOSE
 If new analysis conviction drops to LOW/NONE → CLOSE (conviction collapsed)
 ```
 
-Runs on every qualifying flow alert for tickers with open positions. Uses a 15-minute cooldown per ticker to avoid redundant API calls. Only triggers on sweep orders that pass volume/OI filters. Same-company tickers (GOOG/GOOGL) are checked.
+Runs on every qualifying flow alert for tickers with open positions. Uses a 15-minute cooldown per ticker to avoid redundant API calls. Only triggers on sweep orders that pass volume/OI filters. Same-company tickers (GOOG/GOOGL) are checked. LEAP-DTE sweeps (180+) still trigger contradiction checks for existing positions.
 
 #### 1. Breakeven Stop
 
@@ -175,7 +188,7 @@ If peak premium PnL ever reached >= +10% → stop moves from -40% to 0%
 If premium PnL then drops to <= 0% → CLOSE
 ```
 
-Once a swing position has been +10% green, the hard stop tightens to breakeven. This prevents positions that were profitable from becoming -40% losers. The stop ratchets one way — once activated, it stays at 0% even if the position dips and recovers. Does not apply to LEAPs (they need more room).
+Once a swing position has been +10% green, the hard stop tightens to breakeven. This prevents positions that were profitable from becoming -40% losers. The stop ratchets one way — once activated, it never reverts. Also enforced on position load so existing positions get protected on restart. Does not apply to LEAPs.
 
 #### 2. Hard Stop
 
@@ -183,7 +196,7 @@ Once a swing position has been +10% green, the hard stop tightens to breakeven. 
 If premium PnL <= -40% → CLOSE
 ```
 
-Non-negotiable. Limits max loss on any single trade.
+Non-negotiable. Limits max loss on any single trade. Only applies if breakeven stop has not been activated.
 
 #### 3. Profit Target
 
@@ -260,7 +273,7 @@ The underlying stop price is set from GEX levels when available:
 - **Bear trades**: call wall resistance, if 2-10% above price
 - **Fallback**: 5% default stop if no GEX level qualifies
 
-This stop is used for the trade plan display and Telegram alerts, but the actual position management uses **premium-based stops** (hard stop at -40%), not underlying price stops — except for LEAPs.
+This stop is used for the trade plan display and Telegram alerts, but the actual position management uses **premium-based stops** (breakeven at 0% or hard stop at -40%), not underlying price stops — except for LEAPs.
 
 ### DTE Guidance
 
@@ -346,11 +359,15 @@ Contract selection follows the highest-premium print from the accumulated flow (
 | OTM <= 30% | ~0.20 |
 | OTM > 30% | ~0.10 |
 
-#### Step 6 — Allocation Cap
+#### Step 6 — Position Cap
+
+Same 8-position cap as swing (shared across all strategies). Slots 1-3 allow MEDIUM+, slots 4-8 require HIGH+.
+
+#### Step 7 — Allocation Cap
 
 Total LEAP exposure cannot exceed 20% of account equity. If adding this trade would breach the cap, it's skipped.
 
-#### Step 7 — Dedup
+#### Step 8 — Dedup
 
 Same as swing — Alpaca API check + Supabase check for existing LEAP positions on same ticker.
 
@@ -364,7 +381,7 @@ Positions are checked every 120 seconds. Exit checks run in this order:
 If premium PnL <= -50% → CLOSE
 ```
 
-Wider than swing (-40%) because LEAPs need more room.
+Wider than swing (-40%) because LEAPs need more room. No breakeven stop for LEAPs.
 
 #### 2. Underlying Stop
 
@@ -418,21 +435,38 @@ Pending LEAP orders that haven't filled within 48 hours are automatically cancel
 
 | Parameter | Swing | LEAP |
 |---|---|---|
-| **Trigger** | Single $100K+ sweep | $300K+ accumulated over 5 days |
+| **Trigger** | Single $100K+ sweep (DTE < 180) | $300K+ accumulated over 5 days (DTE 180+) |
 | **DTE** | 21-45 DTE | 180+ DTE |
 | **Direction source** | 7-layer analysis | LEAP flow accumulation |
 | **Profit target** | Dynamic (20-200%) | None — trail decides |
 | **Trail activation** | 60% of target (max 40%) | +100% (doubled) |
 | **Trail stop** | 20% from peak | 25% from peak |
+| **Breakeven stop** | +10% peak → stop moves to 0% | None |
 | **Hard stop** | -40% premium | -50% premium |
 | **Underlying stop** | None (premium-based only) | -25% stock move |
 | **Theta kill** | Day 5, <10% move | Disabled |
 | **Max hold** | 10 days | 180 days |
 | **Stale order cancel** | 24 hours | 48 hours |
-| **Allocation cap** | Per trade | 20% of equity |
+| **Position cap** | Shared 8-slot cap (3 MEDIUM, 4-8 HIGH+) | Shared 8-slot cap + 20% equity cap |
 | **Technicals filter** | Score >= 50 | Score >= 50 |
 | **Flow contradiction** | Closes on direction flip | Closes on direction flip |
 | **Scan frequency** | Real-time (WebSocket) | Every 30 minutes |
+
+---
+
+## Alerts
+
+### Trade Alerts (real-time)
+- **Entry**: Telegram alert on order fill with contract details
+- **Exit**: Telegram alert with P&L, exit reason, and entry/exit prices
+- **Analysis**: Full strategy alert with 7-layer breakdown, trade plan, and top flow prints
+
+### EOD Daily P&L Report (4:05 PM ET)
+- Realized P&L: all positions closed today with individual P&L and exit reasons
+- Unrealized P&L: all open positions with current mark-to-market
+- Net daily P&L (realized + unrealized)
+- Account equity
+- All-time win/loss stats and win rate
 
 ---
 
@@ -453,7 +487,14 @@ Position management loads only active positions (PENDING/FILLED) from Supabase. 
 
 ### Position Tracking Fields
 
-Each position tracks `peak_premium` (highest option price seen) and `trough_premium` (lowest option price seen) for drawdown analysis. On load, swing positions have `trail_activate_pct` capped at 40% to prevent unreachable trail activation thresholds.
+Each position tracks:
+- `peak_premium` — highest option price seen (for trailing stop and breakeven stop)
+- `trough_premium` — lowest option price seen (for drawdown analysis)
+- `trail_active` — whether trailing stop has been activated
+
+On load, swing positions have:
+- `trail_activate_pct` capped at 40% to prevent unreachable thresholds
+- `premium_stop_pct` tightened to 0% if `peak_premium` already reached +10% above entry (breakeven enforcement)
 
 ---
 
