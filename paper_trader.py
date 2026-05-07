@@ -188,6 +188,12 @@ def _load_positions():
     for pos in _positions:
         if pos.strategy_type != "LEAP" and pos.trail_activate_pct > 40.0:
             pos.trail_activate_pct = 40.0
+        # Enforce breakeven stop on load for positions that already peaked +10%
+        if (pos.strategy_type != "LEAP" and pos.filled_price and pos.peak_premium
+                and pos.premium_stop_pct < 0):
+            peak_pnl = (pos.peak_premium - pos.filled_price) / pos.filled_price * 100
+            if peak_pnl >= 10.0:
+                pos.premium_stop_pct = 0.0
     _positions_loaded = True
 
 
@@ -380,8 +386,17 @@ def check_and_manage_positions():
             if pos.trough_premium is None or current_price < pos.trough_premium:
                 pos.trough_premium = current_price
 
+            # Breakeven stop: once position hits +10%, stop moves from -40% to 0%
+            BREAKEVEN_TRIGGER_PCT = 10.0
+            if pos.strategy_type != "LEAP" and pos.peak_premium:
+                peak_pnl = (pos.peak_premium - entry) / entry * 100
+                if peak_pnl >= BREAKEVEN_TRIGGER_PCT and pos.premium_stop_pct < 0:
+                    pos.premium_stop_pct = 0.0
+                    log.info("[PAPER] %s: Breakeven stop activated (peak was +%.1f%%)", pos.ticker, peak_pnl)
+
             if pnl_pct <= pos.premium_stop_pct:
-                _close_position(tc, pos, current_price, f"hard stop ({pnl_pct:+.1f}%)")
+                reason = f"breakeven stop ({pnl_pct:+.1f}%)" if pos.premium_stop_pct == 0.0 else f"hard stop ({pnl_pct:+.1f}%)"
+                _close_position(tc, pos, current_price, reason)
                 continue
 
             if pos.strategy_type == "LEAP" and pos.underlying_entry > 0:
@@ -1107,6 +1122,14 @@ async def _handle_option_quote(data):
         if pos.trough_premium is None or current_price < pos.trough_premium:
             pos.trough_premium = current_price
 
+        # Breakeven stop: once position hits +10%, stop moves from -40% to 0%
+        BREAKEVEN_TRIGGER_PCT = 10.0
+        if pos.strategy_type != "LEAP" and pos.peak_premium:
+            peak_pnl = (pos.peak_premium - entry) / entry * 100
+            if peak_pnl >= BREAKEVEN_TRIGGER_PCT and pos.premium_stop_pct < 0:
+                pos.premium_stop_pct = 0.0
+                log.info("[PAPER] %s: Breakeven stop activated (peak was +%.1f%%)", pos.ticker, peak_pnl)
+
         tc = _get_trading_client()
         if not tc:
             return
@@ -1124,7 +1147,8 @@ async def _handle_option_quote(data):
             return False
 
         if pnl_pct <= pos.premium_stop_pct:
-            if await _try_close(f"hard stop ({pnl_pct:+.1f}%)"):
+            reason = f"breakeven stop ({pnl_pct:+.1f}%)" if pos.premium_stop_pct == 0.0 else f"hard stop ({pnl_pct:+.1f}%)"
+            if await _try_close(reason):
                 return
 
         if pos.strategy_type == "LEAP" and pos.underlying_entry > 0:

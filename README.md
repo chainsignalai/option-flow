@@ -168,7 +168,16 @@ If new analysis conviction drops to LOW/NONE → CLOSE (conviction collapsed)
 
 Runs on every qualifying flow alert for tickers with open positions. Uses a 15-minute cooldown per ticker to avoid redundant API calls. Only triggers on sweep orders that pass volume/OI filters. Same-company tickers (GOOG/GOOGL) are checked.
 
-#### 1. Hard Stop
+#### 1. Breakeven Stop
+
+```
+If peak premium PnL ever reached >= +10% → stop moves from -40% to 0%
+If premium PnL then drops to <= 0% → CLOSE
+```
+
+Once a swing position has been +10% green, the hard stop tightens to breakeven. This prevents positions that were profitable from becoming -40% losers. The stop ratchets one way — once activated, it stays at 0% even if the position dips and recovers. Does not apply to LEAPs (they need more room).
+
+#### 2. Hard Stop
 
 ```
 If premium PnL <= -40% → CLOSE
@@ -176,7 +185,7 @@ If premium PnL <= -40% → CLOSE
 
 Non-negotiable. Limits max loss on any single trade.
 
-#### 2. Profit Target
+#### 3. Profit Target
 
 ```
 If premium PnL >= premium_target_pct → CLOSE
@@ -211,7 +220,7 @@ premium_target = target_pct × option_leverage
 
 Premium target is clamped to 20-200%.
 
-#### 3. Trailing Stop
+#### 4. Trailing Stop
 
 ```
 If premium PnL >= trail_activate_pct → activate trailing
@@ -223,7 +232,7 @@ Once active, if drawdown from peak >= trail_stop_pct → CLOSE
 
 This is the key mechanism for capturing outsized gains — once the trail activates, it lets winners run while locking in profit on pullback.
 
-#### 4. Theta Kill
+#### 5. Theta Kill
 
 ```
 If days_held >= theta_kill_days AND abs(premium PnL) < theta_kill_move_pct → CLOSE
@@ -235,7 +244,7 @@ Adjusted for earnings proximity:
 - Earnings <= 7 days: theta_kill_days = min(2, max_hold - 1)
 - Earnings <= 14 days: theta_kill_days = min(4, max_hold - 2)
 
-#### 5. Max Hold
+#### 6. Max Hold
 
 ```
 If days_held >= max_hold_days → CLOSE
