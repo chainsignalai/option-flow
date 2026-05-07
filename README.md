@@ -30,7 +30,7 @@ Unusual Whales WebSocket
 
 ### Entry Criteria
 
-A swing trade must pass 7 gates before execution:
+A swing trade must pass 8 gates before execution:
 
 #### Gate 1 — Flow Trigger (WebSocket, real-time)
 
@@ -129,7 +129,11 @@ Before placing any order:
 
 If the ticker (or a same-company ticker) already has an open swing position → skip.
 
-#### Gate 6 — Trade Plan Validation
+#### Gate 6 — Technicals Filter
+
+Technicals score must be >= 50 to place a paper trade. Trades with weak technicals (fighting momentum) are still analyzed and alerted via Telegram but do not execute. Based on live data: all 10 winners had technicals = 70, the only sub-50 trade (USO, technicals = 30) lost -$430.
+
+#### Gate 7 — Trade Plan Validation
 
 Must have a valid suggested strike and expiry derived from the qualifying flow prints:
 - Correct option type (CALL for bull, PUT for bear)
@@ -140,7 +144,17 @@ Must have a valid suggested strike and expiry derived from the qualifying flow p
 
 ### Exit Criteria (Swing)
 
-Positions are checked every 120 seconds. Exit checks run in this order — first match wins:
+Positions are checked every 120 seconds via sync polling AND real-time option quote streaming. Exit checks run in this order — first match wins:
+
+#### 0. Flow Contradiction
+
+```
+If new sweep flow flips direction (BULLISH → BEARISH or vice versa)
+AND new analysis conviction >= MEDIUM → CLOSE
+If new analysis conviction drops to LOW/NONE → CLOSE (conviction collapsed)
+```
+
+Runs on every qualifying flow alert for tickers with open positions. Uses a 15-minute cooldown per ticker to avoid redundant API calls. Only triggers on sweep orders that pass volume/OI filters. Same-company tickers (GOOG/GOOGL) are checked.
 
 #### 1. Hard Stop
 
@@ -395,6 +409,8 @@ Pending LEAP orders that haven't filled within 48 hours are automatically cancel
 | **Max hold** | 10 days | 180 days |
 | **Stale order cancel** | 24 hours | 48 hours |
 | **Allocation cap** | Per trade | 20% of equity |
+| **Technicals filter** | Score >= 50 | Score >= 50 |
+| **Flow contradiction** | Closes on direction flip | Closes on direction flip |
 | **Scan frequency** | Real-time (WebSocket) | Every 30 minutes |
 
 ---
@@ -413,6 +429,10 @@ All data is stored in Supabase:
 | `backtest_trades` | Individual backtest trade results |
 
 Position management loads only active positions (PENDING/FILLED) from Supabase. Closed positions are persisted but not reloaded on restart.
+
+### Position Tracking Fields
+
+Each position tracks `peak_premium` (highest option price seen) and `trough_premium` (lowest option price seen) for drawdown analysis. On load, swing positions have `trail_activate_pct` capped at 40% to prevent unreachable trail activation thresholds.
 
 ---
 
