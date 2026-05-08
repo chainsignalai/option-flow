@@ -2868,6 +2868,7 @@ class LiveMonitor:
     async def _handle_flow_alert(self, payload: dict):
         ticker = payload.get("ticker", "")
         premium = _float(payload.get("total_premium"))
+        log.info(f"[LIVE] Payload keys: {list(payload.keys())}")
 
         if not ticker or ticker in ETF_BLACKLIST:
             return

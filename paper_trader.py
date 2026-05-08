@@ -790,11 +790,21 @@ def _close_position(tc, pos: PaperPosition, current_price: float, reason: str):
     pnl_emoji = "🟢" if pos.pnl_pct and pos.pnl_pct > 0 else "🔴"
     entry_str = f"${pos.filled_price:.2f}" if pos.filled_price is not None else "N/A"
     pnl_str = f"{pos.pnl_pct:+.1f}%" if pos.pnl_pct is not None else "?%"
+    pnl_dollar = (current_price - pos.filled_price) * (pos.quantity or 1) * 100 if pos.filled_price else 0
+    cost_dollar = (pos.filled_price or 0) * (pos.quantity or 1) * 100
+    exit_dollar = current_price * (pos.quantity or 1) * 100
+    peak_str = ""
+    if pos.peak_premium and pos.filled_price:
+        peak_pnl = (pos.peak_premium - pos.filled_price) / pos.filled_price * 100
+        peak_dollar = (pos.peak_premium - pos.filled_price) * (pos.quantity or 1) * 100
+        peak_str = f"\nPeak: ${pos.peak_premium:.2f} (+{peak_pnl:.1f}% / +${peak_dollar:,.0f})"
     _send_paper_telegram(
         f"{pnl_emoji} <b>PAPER TRADE CLOSED</b>\n"
         f"{pos.ticker} {pos.option_type} ${pos.strike:.0f} exp {pos.expiry}\n"
-        f"Entry: {entry_str} → Exit: ${current_price:.2f}\n"
-        f"PnL: {pnl_str} | Reason: {reason}"
+        f"Entry: {entry_str} (${cost_dollar:,.0f}) → Exit: ${current_price:.2f} (${exit_dollar:,.0f})\n"
+        f"PnL: {pnl_str} / ${pnl_dollar:+,.0f}"
+        f"{peak_str}\n"
+        f"Reason: {reason}"
     )
 
 

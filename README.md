@@ -181,14 +181,22 @@ If new analysis conviction drops to LOW/NONE → CLOSE (conviction collapsed)
 
 Runs on every qualifying flow alert for tickers with open positions. Uses a 15-minute cooldown per ticker to avoid redundant API calls. Only triggers on sweep orders that pass volume/OI filters. Same-company tickers (GOOG/GOOGL) are checked. LEAP-DTE sweeps (180+) still trigger contradiction checks for existing positions.
 
-#### 1. Breakeven Stop
+#### 1. Progressive Stop Ratchet
 
-```
-If peak premium PnL ever reached >= +10% → stop moves from -40% to 0%
-If premium PnL then drops to <= 0% → CLOSE
-```
+As a swing position's peak profit grows, the stop floor automatically tightens:
 
-Once a swing position has been +10% green, the hard stop tightens to breakeven. This prevents positions that were profitable from becoming -40% losers. The stop ratchets one way — once activated, it never reverts. Also enforced on position load so existing positions get protected on restart. Does not apply to LEAPs.
+| Peak PnL | Stop Floor | Effect |
+|---|---|---|
+| +10% | 0% (breakeven) | Prevents winners from becoming losers |
+| +20% | +10% | Locks in first 10% of profit |
+| +30% | 15% trail from peak | ~+25.5% floor |
+| +50% | 10% trail from peak | ~+45% floor |
+| +80% | 7% trail from peak | ~+74% floor |
+| +100%+ | 5% trail from peak | ~+95% floor |
+
+The ratchet is one-way — the stop only moves up, never down. Enforced in both sync polling and real-time quote streaming, and re-applied on position load so existing positions get protected on restart. Does not apply to LEAPs.
+
+Example: MU peaked at +103% → stop floor at +97.8%. Instead of giving back 41 points of profit with a flat 20% trail, it locks in nearly all gains.
 
 #### 2. Hard Stop
 
@@ -196,7 +204,7 @@ Once a swing position has been +10% green, the hard stop tightens to breakeven. 
 If premium PnL <= -40% → CLOSE
 ```
 
-Non-negotiable. Limits max loss on any single trade. Only applies if breakeven stop has not been activated.
+Non-negotiable. Limits max loss on any single trade. Only applies if progressive stop has not raised the floor above -40%.
 
 #### 3. Profit Target
 
@@ -233,7 +241,7 @@ premium_target = target_pct × option_leverage
 
 Premium target is clamped to 20-200%.
 
-#### 4. Trailing Stop
+#### 4. Legacy Trailing Stop (safety net)
 
 ```
 If premium PnL >= trail_activate_pct → activate trailing
@@ -243,7 +251,7 @@ Once active, if drawdown from peak >= trail_stop_pct → CLOSE
 - Trail activation = 60% of the premium target, capped at 40%
 - Trail stop = 20% drawdown from the peak premium
 
-This is the key mechanism for capturing outsized gains — once the trail activates, it lets winners run while locking in profit on pullback.
+This is a legacy backstop — the progressive stop ratchet (Exit 1) handles profit protection at all levels and will typically close positions before this fires. Kept as a safety net for edge cases.
 
 #### 5. Theta Kill
 
@@ -440,8 +448,8 @@ Pending LEAP orders that haven't filled within 48 hours are automatically cancel
 | **Direction source** | 7-layer analysis | LEAP flow accumulation |
 | **Profit target** | Dynamic (20-200%) | None — trail decides |
 | **Trail activation** | 60% of target (max 40%) | +100% (doubled) |
-| **Trail stop** | 20% from peak | 25% from peak |
-| **Breakeven stop** | +10% peak → stop moves to 0% | None |
+| **Trail stop** | 20% from peak (legacy, superseded by progressive) | 25% from peak |
+| **Progressive stop** | +10%→0%, +20%→+10%, +30%→15%trail, +50%→10%trail, +80%→7%trail, +100%→5%trail | None |
 | **Hard stop** | -40% premium | -50% premium |
 | **Underlying stop** | None (premium-based only) | -25% stock move |
 | **Theta kill** | Day 5, <10% move | Disabled |
@@ -458,7 +466,7 @@ Pending LEAP orders that haven't filled within 48 hours are automatically cancel
 
 ### Trade Alerts (real-time)
 - **Entry**: Telegram alert on order fill with contract details
-- **Exit**: Telegram alert with P&L, exit reason, and entry/exit prices
+- **Exit**: Telegram alert with P&L percentage and dollar amounts, cost basis, exit value, peak premium info, and exit reason
 - **Analysis**: Full strategy alert with 7-layer breakdown, trade plan, and top flow prints
 
 ### EOD Daily P&L Report (4:05 PM ET)
@@ -488,13 +496,14 @@ Position management loads only active positions (PENDING/FILLED) from Supabase. 
 ### Position Tracking Fields
 
 Each position tracks:
-- `peak_premium` — highest option price seen (for trailing stop and breakeven stop)
+- `peak_premium` — highest option price seen (for progressive stop ratchet)
 - `trough_premium` — lowest option price seen (for drawdown analysis)
-- `trail_active` — whether trailing stop has been activated
+- `trail_active` — whether legacy trailing stop has been activated
+- `market_return_pct` — SPY daily return at time of entry (for red-day vs green-day analysis)
 
 On load, swing positions have:
 - `trail_activate_pct` capped at 40% to prevent unreachable thresholds
-- `premium_stop_pct` tightened to 0% if `peak_premium` already reached +10% above entry (breakeven enforcement)
+- `premium_stop_pct` ratcheted up via `_progressive_stop()` based on peak P/L (e.g., +103% peak → +97.8% stop floor)
 
 ---
 
