@@ -97,6 +97,33 @@ def _get_spy_daily_return() -> Optional[float]:
     return None
 
 
+def _progressive_stop(peak_pnl_pct: float) -> Optional[float]:
+    """Return the stop-loss floor based on how far the position has peaked.
+
+    Progressive ratchet:
+      Peak +10%  → stop at 0% (breakeven)
+      Peak +20%  → stop at +10%
+      Peak +30%  → trail 15% from peak
+      Peak +50%  → trail 10% from peak
+      Peak +80%  → trail 7% from peak
+      Peak +100% → trail 5% from peak
+    Returns None if peak hasn't reached +10%.
+    """
+    if peak_pnl_pct >= 100:
+        return peak_pnl_pct - (peak_pnl_pct * 0.05)
+    if peak_pnl_pct >= 80:
+        return peak_pnl_pct - (peak_pnl_pct * 0.07)
+    if peak_pnl_pct >= 50:
+        return peak_pnl_pct - (peak_pnl_pct * 0.10)
+    if peak_pnl_pct >= 30:
+        return peak_pnl_pct - (peak_pnl_pct * 0.15)
+    if peak_pnl_pct >= 20:
+        return 10.0
+    if peak_pnl_pct >= 10:
+        return 0.0
+    return None
+
+
 def _get_alpaca_tickers(tc) -> set[str]:
     """Get tickers with open positions or pending orders on Alpaca (source of truth for dedup)."""
     tickers = set()
@@ -218,12 +245,12 @@ def _load_positions():
     for pos in _positions:
         if pos.strategy_type != "LEAP" and pos.trail_activate_pct > 40.0:
             pos.trail_activate_pct = 40.0
-        # Enforce breakeven stop on load for positions that already peaked +10%
-        if (pos.strategy_type != "LEAP" and pos.filled_price and pos.peak_premium
-                and pos.premium_stop_pct < 0):
+        # Enforce progressive stop ratchet on load
+        if pos.strategy_type != "LEAP" and pos.filled_price and pos.peak_premium:
             peak_pnl = (pos.peak_premium - pos.filled_price) / pos.filled_price * 100
-            if peak_pnl >= 10.0:
-                pos.premium_stop_pct = 0.0
+            new_floor = _progressive_stop(peak_pnl)
+            if new_floor is not None and new_floor > pos.premium_stop_pct:
+                pos.premium_stop_pct = new_floor
     _positions_loaded = True
 
 
@@ -417,16 +444,21 @@ def check_and_manage_positions():
             if pos.trough_premium is None or current_price < pos.trough_premium:
                 pos.trough_premium = current_price
 
-            # Breakeven stop: once position hits +10%, stop moves from -40% to 0%
-            BREAKEVEN_TRIGGER_PCT = 10.0
+            # Progressive stop ratchet (non-LEAP only)
             if pos.strategy_type != "LEAP" and pos.peak_premium:
                 peak_pnl = (pos.peak_premium - entry) / entry * 100
-                if peak_pnl >= BREAKEVEN_TRIGGER_PCT and pos.premium_stop_pct < 0:
-                    pos.premium_stop_pct = 0.0
-                    log.info("[PAPER] %s: Breakeven stop activated (peak was +%.1f%%)", pos.ticker, peak_pnl)
+                new_floor = _progressive_stop(peak_pnl)
+                if new_floor is not None and new_floor > pos.premium_stop_pct:
+                    old_stop = pos.premium_stop_pct
+                    pos.premium_stop_pct = new_floor
+                    log.info("[PAPER] %s: Stop ratcheted %.1f%% → %.1f%% (peak +%.1f%%)",
+                             pos.ticker, old_stop, new_floor, peak_pnl)
 
             if pnl_pct <= pos.premium_stop_pct:
-                reason = f"breakeven stop ({pnl_pct:+.1f}%)" if pos.premium_stop_pct == 0.0 else f"hard stop ({pnl_pct:+.1f}%)"
+                reason = (f"progressive stop ({pnl_pct:+.1f}%, floor was {pos.premium_stop_pct:+.1f}%)"
+                          if pos.premium_stop_pct > 0
+                          else f"breakeven stop ({pnl_pct:+.1f}%)" if pos.premium_stop_pct == 0.0
+                          else f"hard stop ({pnl_pct:+.1f}%)")
                 _close_position(tc, pos, current_price, reason)
                 continue
 
@@ -1154,13 +1186,15 @@ async def _handle_option_quote(data):
         if pos.trough_premium is None or current_price < pos.trough_premium:
             pos.trough_premium = current_price
 
-        # Breakeven stop: once position hits +10%, stop moves from -40% to 0%
-        BREAKEVEN_TRIGGER_PCT = 10.0
+        # Progressive stop ratchet (non-LEAP only)
         if pos.strategy_type != "LEAP" and pos.peak_premium:
             peak_pnl = (pos.peak_premium - entry) / entry * 100
-            if peak_pnl >= BREAKEVEN_TRIGGER_PCT and pos.premium_stop_pct < 0:
-                pos.premium_stop_pct = 0.0
-                log.info("[PAPER] %s: Breakeven stop activated (peak was +%.1f%%)", pos.ticker, peak_pnl)
+            new_floor = _progressive_stop(peak_pnl)
+            if new_floor is not None and new_floor > pos.premium_stop_pct:
+                old_stop = pos.premium_stop_pct
+                pos.premium_stop_pct = new_floor
+                log.info("[PAPER] %s: Stop ratcheted %.1f%% → %.1f%% (peak +%.1f%%)",
+                         pos.ticker, old_stop, new_floor, peak_pnl)
 
         tc = _get_trading_client()
         if not tc:
@@ -1179,7 +1213,10 @@ async def _handle_option_quote(data):
             return False
 
         if pnl_pct <= pos.premium_stop_pct:
-            reason = f"breakeven stop ({pnl_pct:+.1f}%)" if pos.premium_stop_pct == 0.0 else f"hard stop ({pnl_pct:+.1f}%)"
+            reason = (f"progressive stop ({pnl_pct:+.1f}%, floor was {pos.premium_stop_pct:+.1f}%)"
+                      if pos.premium_stop_pct > 0
+                      else f"breakeven stop ({pnl_pct:+.1f}%)" if pos.premium_stop_pct == 0.0
+                      else f"hard stop ({pnl_pct:+.1f}%)")
             if await _try_close(reason):
                 return
 
