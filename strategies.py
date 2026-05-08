@@ -188,7 +188,7 @@ class TradePlan:
     strike_reason: str = ""
     # Option premium management (dynamic)
     premium_target_pct: Optional[float] = None
-    premium_stop_pct: float = -40.0
+    premium_stop_pct: float = -25.0
     trail_activate_pct: Optional[float] = None
     trail_stop_pct: float = 20.0
     # Theta decay management
@@ -1844,7 +1844,7 @@ def compute_trade_plan(result: StrategyResult, regime: str = None) -> TradePlan:
     # --- Step 4: Option Premium Target (underlying move × leverage) ---
     tp.premium_target_pct = round(tp.target_pct * tp.option_leverage, 0)
     tp.premium_target_pct = max(20, min(tp.premium_target_pct, 200))
-    tp.premium_stop_pct = -40.0
+    tp.premium_stop_pct = -25.0
     tp.trail_activate_pct = round(min(tp.premium_target_pct * 0.6, 40.0), 0)
     tp.trail_stop_pct = 20.0
 
@@ -2843,10 +2843,7 @@ class LiveMonitor:
                 log.info(f"[LIVE] {ticker}: NEUTRAL regime — logged but skipping alert/trade (PF 0.93 over 126 trades)")
                 return
 
-            if self.send_telegram and r_level >= min_level:
-                send_telegram_alert(result)
-                log.info(f"[LIVE] 📱 Telegram alert sent for {ticker} ({result.conviction})")
-
+            if r_level >= min_level:
                 if self.paper_trade and result.trade_plan:
                     if result.technicals.score < 50:
                         log.info(f"[LIVE] {ticker}: Technicals score {result.technicals.score:.0f} < 50 — skipping paper trade")
@@ -2859,8 +2856,8 @@ class LiveMonitor:
                         except Exception as e:
                             log.error(f"[LIVE] Paper trade failed for {ticker}: {e}")
 
-            elif self.send_telegram:
-                log.info(f"[LIVE] {ticker}: Conviction {result.conviction} below threshold {self.min_conviction} — no Telegram")
+            else:
+                log.info(f"[LIVE] {ticker}: Conviction {result.conviction} below threshold {self.min_conviction} — skipping")
         except Exception as e:
             log.error(f"[LIVE] Analysis failed for {ticker}: {e}")
             del self._last_analysis[ticker]
@@ -3179,9 +3176,6 @@ class LiveMonitor:
 
             persistence.save_signal(result, mode="leap", regime=regime,
                                     flow_contradicts=_flow_contradicts(result))
-
-            if self.send_telegram:
-                send_leap_telegram_alert(ticker, leap_prints, result, trade_plan)
 
             if self.paper_trade:
                 if result.technicals.score < 50:

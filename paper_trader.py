@@ -211,7 +211,7 @@ class PaperPosition:
     filled_price: Optional[float] = None
     filled_at: Optional[str] = None
     premium_target_pct: float = 50.0
-    premium_stop_pct: float = -40.0
+    premium_stop_pct: float = -25.0
     trail_activate_pct: float = 30.0
     trail_stop_pct: float = 20.0
     max_hold_days: int = 10

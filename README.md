@@ -201,10 +201,10 @@ Example: MU peaked at +103% → stop floor at +97.8%. Instead of giving back 41 
 #### 2. Hard Stop
 
 ```
-If premium PnL <= -40% → CLOSE
+If premium PnL <= -25% → CLOSE
 ```
 
-Non-negotiable. Limits max loss on any single trade. Only applies if progressive stop has not raised the floor above -40%.
+Non-negotiable. Limits max loss on any single trade. Only applies if progressive stop has not raised the floor above -25%.
 
 #### 3. Profit Target
 
@@ -450,7 +450,7 @@ Pending LEAP orders that haven't filled within 48 hours are automatically cancel
 | **Trail activation** | 60% of target (max 40%) | +100% (doubled) |
 | **Trail stop** | 20% from peak (legacy, superseded by progressive) | 25% from peak |
 | **Progressive stop** | +10%→0%, +20%→+10%, +30%→15%trail, +50%→10%trail, +80%→7%trail, +100%→5%trail | None |
-| **Hard stop** | -40% premium | -50% premium |
+| **Hard stop** | -25% premium | -50% premium |
 | **Underlying stop** | None (premium-based only) | -25% stock move |
 | **Theta kill** | Day 5, <10% move | Disabled |
 | **Max hold** | 10 days | 180 days |
