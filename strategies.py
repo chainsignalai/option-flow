@@ -15,6 +15,17 @@ import db as persistence
 
 load_dotenv()
 
+BROKER = os.getenv("BROKER", "alpaca").lower()
+
+
+def _get_broker_module():
+    if BROKER == "ib":
+        import ib_trader
+        return ib_trader
+    import paper_trader
+    return paper_trader
+
+
 # ---------------------------------------------------------------------------
 # Definitions:
 # OTM = Out of the Money — a call with a strike price above the current stock price, or a put with a strike below. These are cheaper (no intrinsic value, pure premium), which is why they're leveraged directional bets. If someone is buying OTM options aggressively, they're betting on a big move.
@@ -50,6 +61,26 @@ ETF_BLACKLIST = {
     "SPXS", "UPRO", "SDS", "SSO", "QLD", "PSQ", "SH", "VIXY",
     "FXI", "IEMG", "VWO", "EFA", "AGG", "LQD", "JNK", "IEF",
     "GOVT", "BND", "BITO", "GBTC", "ETHE",
+}
+
+EARNINGS_SCAN_UNIVERSE = {
+    "AAPL", "ABNB", "ADBE", "ADI", "ADP", "ADSK", "AIG", "AMAT", "AMD",
+    "AMGN", "AMZN", "ANET", "ANSS", "APH", "ASML", "AVGO", "AXP", "BA",
+    "BABA", "BAC", "BIDU", "BIIB", "BK", "BKNG", "BMY", "BRK.B", "BSX",
+    "C", "CAT", "CCI", "CDNS", "CEG", "CHTR", "CL", "CMCSA", "CME",
+    "CMG", "COP", "COST", "CRM", "CRWD", "CSCO", "CTAS", "CVX", "DASH",
+    "DDOG", "DE", "DHR", "DIS", "DLTR", "DXCM", "EA", "EBAY", "EMR",
+    "ENPH", "EOG", "EW", "EXPE", "F", "FANG", "FCX", "FDX", "FSLR",
+    "FTNT", "GE", "GEHC", "GILD", "GM", "GOOG", "GOOGL", "GS", "HD",
+    "HON", "IBM", "ICE", "INTC", "INTU", "ISRG", "JNJ", "JPM", "KO",
+    "LIN", "LLY", "LRCX", "LULU", "LVS", "MA", "MCD", "MCHP", "MDLZ",
+    "MDT", "MELI", "MET", "META", "MNST", "MO", "MRNA", "MRK", "MRVL",
+    "MS", "MSFT", "MU", "NEE", "NFLX", "NKE", "NOW", "NVDA", "NXPI",
+    "ON", "ORCL", "PANW", "PDD", "PEP", "PFE", "PG", "PLTR", "PM",
+    "PYPL", "QCOM", "REGN", "RIVN", "ROKU", "RTX", "SBUX", "SCHW",
+    "SHOP", "SMCI", "SNAP", "SNOW", "SO", "SQ", "T", "TGT", "TJX",
+    "TMO", "TMUS", "TSLA", "TSM", "TXN", "UBER", "UNH", "UNP", "UPS",
+    "URI", "V", "VRTX", "VZ", "WFC", "WMT", "WYNN", "XOM", "ZS",
 }
 
 logging.basicConfig(
@@ -132,6 +163,8 @@ class TechnicalScore:
     macd_histogram: Optional[float] = None         # MACD minus Signal line. Positive = upward momentum, Negative = downward
     sma_20: Optional[float] = None                 # 20-day Simple Moving Average — short-term trend
     sma_50: Optional[float] = None                 # 50-day Simple Moving Average — medium-term trend
+    bb_upper: Optional[float] = None                # Bollinger Band upper (SMA20 + 2σ)
+    bb_lower: Optional[float] = None                # Bollinger Band lower (SMA20 - 2σ)
     vwap: Optional[float] = None                   # Volume-Weighted Average Price — institutional fair value benchmark
     relative_volume: Optional[float] = None        # today's volume / avg volume — >1.5 = unusual activity, >2.0 = very high
     current_price: Optional[float] = None          # latest stock price
@@ -1064,6 +1097,26 @@ def analyze_technicals(ticker: str, current_price: float = None, date: str = Non
     else:
         log.warning(f"[TECH] {ticker}: ⚠️ SMA(50) data unavailable")
 
+    # Bollinger Bands (20-period, 2 std dev)
+    log.info(f"[TECH] {ticker}: Requesting Bollinger Bands(20,2)...")
+    bb_data = uw_get(f"/api/stock/{ticker}/technical-indicator/BBANDS", {
+        "interval": "daily",
+        "time_period": 20,
+        "series_type": "close",
+    })
+    bb_points = bb_data.get("data", [])
+    if bb_points:
+        bb_pt = _find_point_by_date(bb_points, date, strict_before=bool(date))
+        bb_vals = bb_pt.get("values", {})
+        ts.bb_upper = _float(bb_vals.get("Real Upper Band"))
+        ts.bb_lower = _float(bb_vals.get("Real Lower Band"))
+        if ts.bb_upper and ts.bb_lower:
+            log.info(f"[TECH] {ticker}: Bollinger Bands — Lower=${ts.bb_lower:.2f} | Upper=${ts.bb_upper:.2f}")
+        else:
+            log.warning(f"[TECH] {ticker}: ⚠️ BBANDS data missing expected fields: {list(bb_vals.keys())}")
+    else:
+        log.warning(f"[TECH] {ticker}: ⚠️ Bollinger Bands data unavailable")
+
     # VWAP — institutional fair value. Price above VWAP = buyers in control.
     log.info(f"[TECH] {ticker}: Requesting VWAP...")
     vwap_data = uw_get(f"/api/stock/{ticker}/technical-indicator/VWAP", {
@@ -1142,6 +1195,15 @@ def analyze_technicals(ticker: str, current_price: float = None, date: str = Non
     elif ts.vwap:
         log.info(f"[TECH] {ticker}: Scoring — VWAP available but no price context: +0 → {score}")
 
+    # Bollinger Bands + RSI confluence
+    if ts.bb_lower and ts.bb_upper and ts.current_price and ts.rsi_14 is not None:
+        if ts.current_price <= ts.bb_lower and ts.rsi_14 < 35:
+            score += 10
+            log.info(f"[TECH] {ticker}: Scoring — BB+RSI oversold confluence (price≤lower BB, RSI={ts.rsi_14:.1f}<35): +10 → {score}")
+        elif ts.current_price >= ts.bb_upper and ts.rsi_14 > 65:
+            score -= 10
+            log.info(f"[TECH] {ticker}: Scoring — BB+RSI overbought warning (price≥upper BB, RSI={ts.rsi_14:.1f}>65): -10 → {score}")
+
     # Relative volume — confirms institutional participation
     if ts.relative_volume:
         if ts.relative_volume >= 2.0:
@@ -1170,6 +1232,7 @@ def analyze_technicals(ticker: str, current_price: float = None, date: str = Non
         f"[TECH] {ticker}: ✅ FINAL — RSI={ts.rsi_14} | "
         f"MACD_hist={ts.macd_histogram} | "
         f"SMA20=${ts.sma_20} SMA50=${ts.sma_50} | "
+        f"BB=[${ts.bb_lower},{ts.bb_upper}] | "
         f"VWAP=${ts.vwap} | RVOL={ts.relative_volume} | "
         f"Trend={'UP' if ts.trend_aligned else 'DOWN'} | "
         f"Score={ts.score:.1f}/100 | Signal={ts.signal.value}"
@@ -1766,16 +1829,16 @@ def compute_trade_plan(result: StrategyResult, regime: str = None) -> TradePlan:
 
     # --- DTE Guidance (computed first so contract selector can use it) ---
     flow_dtes = [d['dte'] for d in result.flow.details
-                 if d.get('dte') and 6 <= d['dte'] <= 180]
+                 if d.get('dte') and 3 <= d['dte'] <= 180]
     if flow_dtes:
         median_dte = sorted(flow_dtes)[len(flow_dtes) // 2]
-        dte_min = max(median_dte, 21)
-        dte_max = dte_min + 21
+        dte_min = max(median_dte, 3)
+        dte_max = max(dte_min + 14, 21)
     elif earnings_dte is not None and earnings_dte <= 30:
         dte_min = earnings_dte + 7
         dte_max = earnings_dte + 21
     else:
-        dte_min = 21
+        dte_min = 7
         dte_max = 45
     tp.suggested_dte = f"{dte_min}-{dte_max} DTE"
 
@@ -1805,6 +1868,9 @@ def compute_trade_plan(result: StrategyResult, regime: str = None) -> TradePlan:
         otm_pct = abs(strike - price) / price
         if otm_pct > max_otm:
             continue
+        est_delta = 0.50 if otm_pct <= 0.02 else 0.35 if otm_pct <= 0.05 else 0.25 if otm_pct <= 0.10 else 0.15
+        if est_delta < 0.20:
+            continue
         passing_prints.append(d)
         if top_premium_flow is None or d.get('premium', 0) > top_premium_flow.get('premium', 0):
             top_premium_flow = d
@@ -1825,6 +1891,26 @@ def compute_trade_plan(result: StrategyResult, regime: str = None) -> TradePlan:
         )
         if flow_strike and flow_strike != tp.suggested_strike:
             tp.strike_reason += f" (top flow was ${flow_strike:.0f})"
+
+    if not best_flow:
+        from datetime import datetime as _dt, timedelta as _td
+        median_dte = sorted(flow_dtes)[len(flow_dtes) // 2] if flow_dtes else (dte_min + dte_max) // 2
+        target_dte = max(min(median_dte, dte_max), dte_min)
+        synth_expiry = (_dt.now() + _td(days=target_dte)).strftime("%Y-%m-%d")
+        otm_frac = 0.03
+        if want_type == "CALL":
+            raw_strike = price * (1 + otm_frac)
+        else:
+            raw_strike = price * (1 - otm_frac)
+        increment = 0.5 if price < 50 else (1.0 if price < 200 else 2.5 if price < 500 else 5.0)
+        tp.suggested_strike = round(raw_strike / increment) * increment
+        tp.suggested_expiry = synth_expiry
+        tp.strike_reason = (
+            f"synthetic — no qualifying {want_type} flow in {dte_min}-{dte_max} DTE, "
+            f"picked ~3% OTM at {target_dte}d"
+        )
+        log.info("[TRADE] %s: No matching flow prints — synthetic contract: %s $%.1f exp %s (%dd)",
+                 result.ticker, want_type, tp.suggested_strike, synth_expiry, target_dte)
 
     if tp.suggested_strike and tp.suggested_strike > 0:
         otm_pct = abs(tp.suggested_strike - price) / price
@@ -1847,6 +1933,17 @@ def compute_trade_plan(result: StrategyResult, regime: str = None) -> TradePlan:
     tp.premium_stop_pct = -25.0
     tp.trail_activate_pct = round(min(tp.premium_target_pct * 0.6, 40.0), 0)
     tp.trail_stop_pct = 20.0
+
+    # --- Cap hold/theta to selected contract's DTE ---
+    contract_dte = None
+    if best_flow and best_flow.get('dte'):
+        contract_dte = int(best_flow['dte'])
+    elif not best_flow and tp.suggested_strike:
+        contract_dte = target_dte
+    if contract_dte and contract_dte < tp.max_hold_days:
+        tp.max_hold_days = max(contract_dte - 1, 1)
+        tp.theta_kill_days = max(contract_dte // 2, 1)
+        tp.expected_move_pct = round(daily_move_pct * tp.max_hold_days ** 0.5, 1)
 
     log.info(
         f"[TRADE] {result.ticker}: Entry=${tp.entry_price} | "
@@ -2006,6 +2103,188 @@ def send_leap_telegram_alert(ticker: str, leap_prints: list,
         return True
     except Exception as e:
         log.error(f"[LEAP] {ticker}: Telegram send failed: {e}")
+        return False
+
+
+def compute_earnings_trade_plan(result: StrategyResult, earnings_prints: list,
+                                earnings_date: str) -> Optional[TradePlan]:
+    """Generate a trade plan for a pre-earnings position.
+
+    Forces exit BEFORE earnings (IV expansion thesis, not earnings prediction).
+    """
+    price = result.technicals.current_price
+    if not price:
+        return None
+
+    tp = TradePlan()
+    tp.entry_price = price
+
+    is_bull = result.direction == Signal.BULLISH
+
+    from datetime import datetime as _dt
+    today = _dt.now().date()
+    try:
+        earn_dt = _dt.strptime(earnings_date[:10], "%Y-%m-%d").date()
+        days_to_earnings = (earn_dt - today).days
+    except (ValueError, TypeError):
+        log.warning(f"[EARN] {result.ticker}: Could not parse earnings_date '{earnings_date}'")
+        return None
+
+    tp.max_hold_days = max(days_to_earnings - 1, 1)
+
+    want_type = "CALL" if is_bull else "PUT"
+    matching = [p for p in earnings_prints
+                if str(p.get("option_type", "")).upper() == want_type]
+    if not matching:
+        matching = earnings_prints
+
+    best = max(matching, key=lambda p: float(p.get("premium", 0)))
+    tp.suggested_strike = float(best["strike"])
+
+    best_expiry = str(best.get("expiry", ""))[:10]
+    try:
+        best_exp_dt = _dt.strptime(best_expiry, "%Y-%m-%d").date()
+        best_dte = (best_exp_dt - today).days
+    except (ValueError, TypeError):
+        best_exp_dt = earn_dt + timedelta(days=14)
+        best_dte = (best_exp_dt - today).days
+
+    min_post_earnings_dte = 7
+    target_exp_dt = earn_dt + timedelta(days=min_post_earnings_dte)
+    if best_exp_dt >= target_exp_dt:
+        tp.suggested_expiry = best_expiry
+        tp.suggested_dte = f"{best_dte} DTE"
+    else:
+        tp.suggested_expiry = target_exp_dt.isoformat()
+        tp.suggested_dte = f"{(target_exp_dt - _dt.now().date()).days} DTE (7d past earnings)"
+
+    strike_dist = (tp.suggested_strike - price) / price if price else 0
+    is_itm = (is_bull and strike_dist < 0) or (not is_bull and strike_dist > 0)
+    abs_dist = abs(strike_dist)
+
+    if is_itm:
+        tp.suggested_delta = 0.65
+    elif abs_dist <= 0.05:
+        tp.suggested_delta = 0.50
+    elif abs_dist <= 0.10:
+        tp.suggested_delta = 0.40
+    else:
+        tp.suggested_delta = 0.30
+    tp.option_leverage = round(1 / tp.suggested_delta, 1) if tp.suggested_delta > 0 else 3.3
+
+    tp.premium_target_pct = 50.0
+    tp.premium_stop_pct = -25.0
+    tp.trail_activate_pct = 25.0
+    tp.trail_stop_pct = 15.0
+    tp.theta_kill_days = max(days_to_earnings - 2, 3)
+    tp.theta_kill_move_pct = 5.0
+
+    tp.stop_pct = 15.0
+    if is_bull:
+        tp.stop_price = round(price * 0.85, 2)
+        tp.target_price = round(price * 1.10, 2)
+    else:
+        tp.stop_price = round(price * 1.15, 2)
+        tp.target_price = round(price * 0.90, 2)
+    tp.stop_reason = "15% underlying stop (pre-earnings)"
+    tp.target_pct = 10.0
+    tp.target_reason = "Pre-earnings IV expansion target"
+
+    risk = abs(price - tp.stop_price)
+    reward = abs(tp.target_price - price)
+    tp.risk_reward = round(reward / risk, 1) if risk > 0 else 0
+
+    total_prem = sum(float(p.get("premium", 0)) for p in earnings_prints)
+    tp.strike_reason = (
+        f"PRE-EARN: following ${total_prem:,.0f} across {len(earnings_prints)} prints — "
+        f"exit before {earnings_date} (IV expansion thesis)"
+    )
+
+    moneyness = "ITM" if is_itm else "OTM"
+    log.info(
+        f"[EARN] {result.ticker}: Plan — {tp.suggested_dte} | "
+        f"Strike=${tp.suggested_strike:.0f} ({abs_dist:.0%} {moneyness}) | "
+        f"Stop=${tp.stop_price:.2f} (-{tp.stop_pct:.0f}%) | "
+        f"Max hold={tp.max_hold_days}d (exit before earnings {earnings_date}) | "
+        f"Trail +{tp.trail_activate_pct:.0f}%/{tp.trail_stop_pct:.0f}%"
+    )
+
+    return tp
+
+
+def send_earnings_telegram_alert(ticker: str, earnings_prints: list,
+                                 result: StrategyResult, earnings_date: str) -> bool:
+    """Send Telegram alert for a pre-earnings flow accumulation candidate."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+
+    total_premium = sum(float(p.get("premium", 0)) for p in earnings_prints)
+    n_prints = len(earnings_prints)
+    sweep_count = sum(1 for p in earnings_prints if p.get("is_sweep"))
+
+    bull_prem = sum(float(p.get("premium", 0)) for p in earnings_prints if p.get("sentiment") == "BULL")
+    bear_prem = sum(float(p.get("premium", 0)) for p in earnings_prints if p.get("sentiment") == "BEAR")
+    direction = result.direction.value
+    sweep_pct = (sweep_count / n_prints * 100) if n_prints > 0 else 0
+
+    msg = (
+        f"📊 <b>PRE-EARNINGS FLOW</b>\n\n"
+        f"<b>{ticker}</b> — {direction}\n"
+        f"Earnings: {earnings_date}\n\n"
+        f"🔥 <b>Accumulation (5 days)</b>\n"
+        f"• {n_prints} prints | ${total_premium:,.0f} total\n"
+        f"• {sweep_count} sweeps ({sweep_pct:.0f}%) | Bull ${bull_prem:,.0f} / Bear ${bear_prem:,.0f}\n\n"
+        f"📈 <b>Analysis</b>\n"
+        f"• Conviction: {result.conviction} | Score: {result.composite_score:.0f}/100\n"
+        f"• Layers aligned: {result.layers_aligned}/4\n"
+        f"• Flow: {result.flow.signal.value} | Tech: {result.technicals.signal.value}\n\n"
+        f"⚠️ Exit BEFORE earnings (IV expansion thesis, not earnings prediction)"
+    )
+
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        httpx.post(url, json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": msg,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }, timeout=10)
+        log.info(f"[EARN] {ticker}: Telegram alert sent")
+        return True
+    except Exception as e:
+        log.error(f"[EARN] {ticker}: Telegram send failed: {e}")
+        return False
+
+
+def send_exit_flow_telegram_alert(ticker: str, option_type: str, bid_prem: float,
+                                  total_prem: float, is_sweep: bool) -> bool:
+    """Send Telegram warning when institutional exit flow is detected on a held position."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+
+    sweep_label = "SWEEP" if is_sweep else "BLOCK"
+    bid_pct = (bid_prem / total_prem * 100) if total_prem > 0 else 0
+
+    msg = (
+        f"⚠️ <b>EXIT FLOW DETECTED</b>\n\n"
+        f"<b>{ticker}</b> — {option_type} {sweep_label}\n"
+        f"Bid-side: ${bid_prem:,.0f} ({bid_pct:.0f}% of ${total_prem:,.0f})\n\n"
+        f"Large bid-side premium on {option_type}s = likely closing/selling\n"
+        f"Monitor position closely — institutional exit may be underway"
+    )
+
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        httpx.post(url, json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": msg,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }, timeout=10)
+        log.info(f"[EXIT] {ticker}: Exit flow Telegram alert sent")
+        return True
+    except Exception as e:
+        log.error(f"[EXIT] {ticker}: Telegram send failed: {e}")
         return False
 
 
@@ -2787,15 +3066,58 @@ class LiveMonitor:
         self._leap_min_dte = 180
         self._leap_accumulation_threshold = 300_000
         self._leap_min_prints = 2
+        # UW event-driven position monitoring: debounce per ticker
+        self._last_uw_position_check: dict[str, datetime] = {}
+        self._uw_position_check_cooldown = 10  # seconds
+        # Pre-earnings flow accumulation scanner
+        self._earnings_watchlist: dict[str, str] = {}  # ticker -> earnings_date ISO
+        self._earnings_alerted: set[str] = set()
+        self._earnings_min_premium = 50_000
+        self._earnings_min_dte = 7
+        self._earnings_max_dte = 90
+        self._earnings_accumulation_threshold = 200_000
+        self._earnings_min_prints = 3
+        self._earnings_directional_threshold = 0.65
+        self._earnings_sweep_threshold = 0.40
+        self._earnings_auto_trade = False
+        # Institutional exit flow detection (bid-side monitoring)
+        self._exit_flow_cooldown: dict[str, datetime] = {}  # ticker -> last alert time
+        self._exit_flow_min_premium = 100_000
+        self._exit_flow_min_bid_pct = 0.60  # 60%+ bid-side = likely selling
+
+    def _uw_check_position(self, ticker: str):
+        """Trigger an immediate position check when a UW event fires for a held ticker.
+
+        Debounced per-ticker to avoid hammering Alpaca on rapid-fire events.
+        Dispatches to a background thread so it never blocks the websocket loop.
+        """
+        if not self.paper_trade:
+            return
+        now = datetime.now()
+        last = self._last_uw_position_check.get(ticker)
+        if last and (now - last).total_seconds() < self._uw_position_check_cooldown:
+            return
+        self._last_uw_position_check[ticker] = now
+        import threading
+        threading.Thread(
+            target=self._uw_check_position_blocking, args=(ticker,), daemon=True
+        ).start()
+
+    def _uw_check_position_blocking(self, ticker: str):
+        try:
+            broker = _get_broker_module()
+            broker.check_and_manage_positions(ticker=ticker)
+        except Exception as e:
+            log.error(f"[LIVE] UW-triggered position check failed for {ticker}: {e}")
 
     def _holds_position(self, ticker: str) -> bool:
         try:
-            from paper_trader import get_open_positions, SAME_COMPANY_TICKERS
+            broker = _get_broker_module()
             match_tickers = {ticker}
-            alt = SAME_COMPANY_TICKERS.get(ticker)
+            alt = broker.SAME_COMPANY_TICKERS.get(ticker)
             if alt:
                 match_tickers.add(alt)
-            return any(p.ticker in match_tickers for p in get_open_positions())
+            return any(p.ticker in match_tickers for p in broker.get_open_positions())
         except Exception:
             return False
 
@@ -2827,8 +3149,8 @@ class LiveMonitor:
 
             if self.paper_trade:
                 try:
-                    from paper_trader import check_flow_contradiction
-                    check_flow_contradiction(result, min_conviction=self.min_conviction)
+                    broker = _get_broker_module()
+                    broker.check_flow_contradiction(result, min_conviction=self.min_conviction)
                 except Exception as e:
                     log.error(f"[LIVE] Flow contradiction check failed for {ticker}: {e}")
 
@@ -2844,13 +3166,20 @@ class LiveMonitor:
                 return
 
             if r_level >= min_level:
+
                 if self.paper_trade and result.trade_plan:
-                    if result.technicals.score < 50:
-                        log.info(f"[LIVE] {ticker}: Technicals score {result.technicals.score:.0f} < 50 — skipping paper trade")
+                    is_bull = result.direction == Signal.BULLISH
+                    tech_skip = (
+                        (is_bull and result.technicals.score < 50) or
+                        (not is_bull and result.technicals.score > 50)
+                    )
+                    if tech_skip:
+                        reason = "< 50 (weak for bullish)" if is_bull else "> 50 (unconfirmed bearish)"
+                        log.info(f"[LIVE] {ticker}: Technicals score {result.technicals.score:.0f} {reason} — skipping paper trade")
                     else:
                         try:
-                            from paper_trader import place_paper_trade
-                            pos = place_paper_trade(result)
+                            broker = _get_broker_module()
+                            pos = broker.place_paper_trade(result)
                             if pos:
                                 log.info(f"[LIVE] 📄 Paper trade placed for {ticker}: {pos.option_type} ${pos.strike} exp {pos.expiry}")
                         except Exception as e:
@@ -2865,10 +3194,13 @@ class LiveMonitor:
     async def _handle_flow_alert(self, payload: dict):
         ticker = payload.get("ticker", "")
         premium = _float(payload.get("total_premium"))
-        log.info(f"[LIVE] Payload keys: {list(payload.keys())}")
 
         if not ticker or ticker in ETF_BLACKLIST:
             return
+
+        # --- Live position monitoring: check exits on every flow event ---
+        if self.paper_trade and self._holds_position(ticker):
+            self._uw_check_position(ticker)
 
         # --- LEAP tracking (before swing cooldown/sweep filters) ---
         expiry_str = payload.get("expiry", "")
@@ -2880,6 +3212,21 @@ class LiveMonitor:
                     self._track_leap_print(ticker, payload, dte)
             except ValueError:
                 pass
+
+        # --- Pre-earnings flow tracking (before swing filters) ---
+        if (ticker in self._earnings_watchlist
+                and premium >= self._earnings_min_premium and expiry_str):
+            try:
+                expiry_date = datetime.strptime(expiry_str[:10], "%Y-%m-%d").date()
+                dte = (expiry_date - datetime.now().date()).days
+                if self._earnings_min_dte <= dte <= self._earnings_max_dte:
+                    self._track_earnings_print(ticker, payload, dte)
+            except ValueError:
+                pass
+
+        # --- Exit flow detection: bid-side monitoring on held positions ---
+        if self.paper_trade and premium >= self._exit_flow_min_premium:
+            self._check_exit_flow(ticker, payload)
 
         # --- Swing analysis path ---
         is_contradiction_bypass = False
@@ -2931,8 +3278,12 @@ class LiveMonitor:
         price = _float(payload.get("price"))
         notional = size * price
         ticker = payload.get("ticker", "")
-        if ticker and notional >= 1_000_000 and ticker not in ETF_BLACKLIST:
+        if not ticker or ticker in ETF_BLACKLIST:
+            return
+        if notional >= 1_000_000:
             log.info(f"[LIVE] 🏦 Dark pool: {ticker} | ${notional:,.0f} | {size:,.0f} shares @ ${price:.2f}")
+        if self.paper_trade and self._holds_position(ticker):
+            self._uw_check_position(ticker)
 
     def _handle_news(self, payload: dict):
         tickers = payload.get("tickers") or []
@@ -2995,6 +3346,8 @@ class LiveMonitor:
         }
         regime = "POSITIVE (dampening)" if gamma > 0 else "NEGATIVE (amplifying)"
         log.debug(f"[LIVE] ⚡ GEX: {ticker} | γ/1%={gamma:,.0f} | {regime}")
+        if self.paper_trade and self._holds_position(ticker):
+            self._uw_check_position(ticker)
 
     def _apply_live_enhancements(self, result: StrategyResult, ticker: str) -> StrategyResult:
         modified = False
@@ -3138,6 +3491,101 @@ class LiveMonitor:
         except Exception as e:
             log.error(f"[LEAP] Failed to persist LEAP flow for {ticker}: {e}")
 
+    def _track_earnings_print(self, ticker: str, payload: dict, dte: int):
+        """Track a pre-earnings flow print and persist to Supabase."""
+        option_type = str(payload.get("type", "")).upper()
+        premium = _float(payload.get("total_premium"))
+        strike = _float(payload.get("strike"))
+        expiry = payload.get("expiry", "")[:10]
+        underlying = _float(payload.get("underlying_price"))
+        is_sweep = payload.get("has_sweep", False)
+        vol_oi = _float(payload.get("volume_oi_ratio"))
+
+        ask_prem = _float(payload.get("total_ask_side_prem"))
+        bid_prem = _float(payload.get("total_bid_side_prem"))
+        side = "ASK" if ask_prem > bid_prem else "BID" if bid_prem > ask_prem else "MID"
+
+        if side == "MID":
+            sentiment = "NEUTRAL"
+        else:
+            is_bullish = (
+                (option_type == "CALL" and side == "ASK") or
+                (option_type == "PUT" and side == "BID")
+            )
+            sentiment = "BULL" if is_bullish else "BEAR"
+
+        earnings_date = self._earnings_watchlist.get(ticker)
+        sweep_label = "SWEEP" if is_sweep else "BLOCK"
+        log.info(
+            f"[EARN] 📊 {ticker}: {sweep_label} {option_type} ${premium:,.0f} | "
+            f"Strike=${strike:.0f} Exp={expiry} {dte}DTE | {side} → {sentiment} | "
+            f"Earnings={earnings_date}"
+        )
+
+        try:
+            persistence.save_earnings_flow(
+                ticker=ticker, option_type=option_type, strike=strike,
+                expiry=expiry, dte=dte, premium=premium, is_sweep=is_sweep,
+                side=side, sentiment=sentiment, underlying_price=underlying,
+                vol_oi_ratio=vol_oi if vol_oi > 0 else None,
+                earnings_date=earnings_date,
+            )
+        except Exception as e:
+            log.error(f"[EARN] Failed to persist earnings flow for {ticker}: {e}")
+
+    def _check_exit_flow(self, ticker: str, payload: dict):
+        """Detect institutional exit flow on held positions via bid-side premium.
+
+        Bid-side on calls = selling calls = closing long positions.
+        Bid-side on puts = selling puts = closing short/hedge positions.
+        """
+        try:
+            broker = _get_broker_module()
+            match_tickers = {ticker}
+            alt = broker.SAME_COMPANY_TICKERS.get(ticker)
+            if alt:
+                match_tickers.add(alt)
+            positions = [p for p in broker.get_open_positions()
+                         if p.ticker in match_tickers and p.status == "FILLED"]
+        except Exception:
+            return
+
+        if not positions:
+            return
+
+        option_type = str(payload.get("type", "")).upper()
+        ask_prem = _float(payload.get("total_ask_side_prem"))
+        bid_prem = _float(payload.get("total_bid_side_prem"))
+        total_prem = _float(payload.get("total_premium"))
+        is_sweep = payload.get("has_sweep", False)
+
+        if total_prem <= 0 or bid_prem <= 0:
+            return
+
+        bid_pct = bid_prem / total_prem
+
+        for pos in positions:
+            if pos.option_type != option_type:
+                continue
+            if bid_pct < self._exit_flow_min_bid_pct:
+                continue
+
+            last_alert = self._exit_flow_cooldown.get(ticker)
+            if last_alert and (datetime.now() - last_alert).total_seconds() < 1800:
+                return
+
+            log.warning(
+                f"[EXIT] ⚠️ {ticker}: Bid-side exit flow detected — "
+                f"{option_type} ${bid_prem:,.0f} bid / ${total_prem:,.0f} total "
+                f"({bid_pct:.0%}) | We hold {pos.option_type} ${pos.strike:.0f}"
+            )
+
+            self._exit_flow_cooldown[ticker] = datetime.now()
+            send_exit_flow_telegram_alert(
+                ticker, option_type, bid_prem, total_prem, is_sweep
+            )
+            return
+
     def _run_leap_analysis(self, ticker: str, leap_prints: list):
         """Run 7-layer analysis and generate LEAP trade plan for a candidate."""
         log.info(f"[LEAP] {'='*50}")
@@ -3178,12 +3626,18 @@ class LiveMonitor:
                                     flow_contradicts=_flow_contradicts(result))
 
             if self.paper_trade:
-                if result.technicals.score < 50:
-                    log.info(f"[LEAP] {ticker}: Technicals score {result.technicals.score:.0f} < 50 — skipping paper trade")
+                is_bull = result.direction == Signal.BULLISH
+                tech_skip = (
+                    (is_bull and result.technicals.score < 50) or
+                    (not is_bull and result.technicals.score > 50)
+                )
+                if tech_skip:
+                    reason = "< 50 (weak for bullish)" if is_bull else "> 50 (unconfirmed bearish)"
+                    log.info(f"[LEAP] {ticker}: Technicals score {result.technicals.score:.0f} {reason} — skipping paper trade")
                 else:
                     try:
-                        from paper_trader import place_leap_trade
-                        pos = place_leap_trade(result, trade_plan)
+                        broker = _get_broker_module()
+                        pos = broker.place_leap_trade(result, trade_plan)
                         if pos:
                             log.info(f"[LEAP] 📄 LEAP paper trade placed for {ticker}: "
                                      f"{pos.option_type} ${pos.strike} exp {pos.expiry}")
@@ -3244,19 +3698,193 @@ class LiveMonitor:
             self._leap_alerted.add(ticker)
             self._run_leap_analysis(ticker, acc["prints"])
 
-    async def _paper_position_loop(self):
-        from paper_trader import check_and_manage_positions
+    def _refresh_earnings_watchlist(self):
+        """Query UW per-ticker to build a watchlist of tickers with earnings 3-14 days out."""
+        watchlist = {}
+        checked = 0
+        for ticker in EARNINGS_SCAN_UNIVERSE:
+            try:
+                data = uw_get(f"/api/earnings/{ticker}")
+                earnings = data.get("data", [])
+                if earnings:
+                    today = datetime.now().date()
+                    for e in earnings:
+                        date_str = e.get("report_date", "")
+                        if not date_str:
+                            continue
+                        try:
+                            earn_date = datetime.strptime(date_str[:10], "%Y-%m-%d").date()
+                            days_out = (earn_date - today).days
+                            if 3 <= days_out <= 14:
+                                watchlist[ticker] = earn_date.isoformat()
+                                log.info(f"[EARN] {ticker}: Earnings {earn_date} ({days_out}d out) — added to watchlist")
+                                break
+                        except ValueError:
+                            continue
+            except Exception as e:
+                log.error(f"[EARN] Failed to check earnings for {ticker}: {e}")
+
+            checked += 1
+            if checked % 20 == 0:
+                log.info(f"[EARN] Watchlist refresh progress: {checked}/{len(EARNINGS_SCAN_UNIVERSE)} tickers checked")
+            time.sleep(4.5)
+
+        self._earnings_watchlist = watchlist
+        log.info(f"[EARN] Watchlist refreshed: {len(watchlist)} tickers with earnings in 3-14 days")
+
+        if watchlist and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+            tickers_str = ", ".join(sorted(watchlist.keys()))
+            try:
+                httpx.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                    json={"chat_id": TELEGRAM_CHAT_ID, "text":
+                        f"📊 Earnings watchlist: {len(watchlist)} tickers\n{tickers_str}",
+                        "disable_web_page_preview": True},
+                    timeout=10,
+                )
+            except Exception:
+                pass
+
+    async def _earnings_watchlist_loop(self):
+        """Refresh earnings watchlist daily at 8 AM ET, plus once at startup."""
+        log.info("[EARN] Running initial earnings watchlist refresh...")
+        await asyncio.to_thread(self._refresh_earnings_watchlist)
+
+        from zoneinfo import ZoneInfo
+        et = ZoneInfo("America/New_York")
         while self._running:
             try:
-                await asyncio.sleep(120)
-                await asyncio.to_thread(check_and_manage_positions)
+                now_et = datetime.now(et)
+                target = now_et.replace(hour=8, minute=0, second=0, microsecond=0)
+                if now_et >= target:
+                    target += timedelta(days=1)
+                wait_secs = (target - now_et).total_seconds()
+                log.info(f"[EARN] Next watchlist refresh in {wait_secs/3600:.1f}h ({target.strftime('%H:%M ET')})")
+                await asyncio.sleep(wait_secs)
+                await asyncio.to_thread(self._refresh_earnings_watchlist)
+            except Exception as e:
+                log.error(f"[EARN] Watchlist loop error: {e}")
+                await asyncio.sleep(3600)
+
+    async def _earnings_scan_loop(self):
+        """Periodically check Supabase for pre-earnings flow accumulation candidates."""
+        await asyncio.sleep(120)
+        while self._running:
+            try:
+                self._earnings_alerted = {
+                    t for t in self._earnings_alerted
+                    if persistence.has_recent_earnings_signal(t, hours=24)
+                }
+                await asyncio.to_thread(self._check_earnings_candidates)
+            except Exception as e:
+                log.error(f"[EARN] Scan loop error: {e}")
+            await asyncio.sleep(1800)
+
+    def _check_earnings_candidates(self):
+        """Query Supabase for tickers with enough pre-earnings flow to analyze."""
+        accumulation = persistence.get_earnings_accumulation(lookback_days=5)
+        if not accumulation:
+            return
+
+        for ticker, acc in accumulation.items():
+            if ticker in self._earnings_alerted:
+                continue
+
+            n_prints = len(acc["prints"])
+            total_prem = acc["total_premium"]
+            bull_prem = acc["bull_premium"]
+            bear_prem = acc["bear_premium"]
+            sweep_count = acc["sweep_count"]
+            total_dir = bull_prem + bear_prem
+
+            if n_prints < self._earnings_min_prints:
+                continue
+            if total_prem < self._earnings_accumulation_threshold:
+                continue
+            if total_dir > 0 and max(bull_prem, bear_prem) / total_dir < self._earnings_directional_threshold:
+                continue
+            if n_prints > 0 and sweep_count / n_prints < self._earnings_sweep_threshold:
+                continue
+
+            if persistence.has_recent_earnings_signal(ticker, hours=24):
+                log.info(f"[EARN] {ticker}: Earnings signal fired <24h ago — skipping")
+                self._earnings_alerted.add(ticker)
+                continue
+
+            log.info(
+                f"[EARN] 🎯 {ticker}: Pre-earnings accumulation detected — "
+                f"{n_prints} prints ({sweep_count} sweeps), ${total_prem:,.0f} total, "
+                f"bull=${bull_prem:,.0f} bear=${bear_prem:,.0f}"
+            )
+
+            self._earnings_alerted.add(ticker)
+            self._run_earnings_analysis(ticker, acc["prints"], acc.get("earnings_date"))
+
+    def _run_earnings_analysis(self, ticker: str, earnings_prints: list,
+                               earnings_date: str = None):
+        """Run 7-layer analysis and generate pre-earnings alert."""
+        log.info(f"[EARN] {'='*50}")
+        log.info(f"[EARN] 📊 Running pre-earnings analysis for {ticker}")
+        log.info(f"[EARN] {'='*50}")
+
+        try:
+            today = datetime.now().strftime("%Y-%m-%d")
+            if self._regime_cache[0] != today:
+                self._regime_cache = (today, get_current_regime())
+            regime = self._regime_cache[1]
+
+            if regime == "NEUTRAL":
+                log.info(f"[EARN] {ticker}: NEUTRAL regime — skipping (no API calls)")
+                return
+
+            bull_prem = sum(float(p.get("premium", 0)) for p in earnings_prints
+                           if p.get("sentiment") == "BULL")
+            bear_prem = sum(float(p.get("premium", 0)) for p in earnings_prints
+                           if p.get("sentiment") == "BEAR")
+            if bull_prem == bear_prem:
+                log.info(f"[EARN] {ticker}: Equal bull/bear premium — no directional edge, skipping")
+                return
+            earn_direction = Signal.BULLISH if bull_prem > bear_prem else Signal.BEARISH
+
+            result = analyze_ticker(ticker, regime=regime)
+            result.direction = earn_direction
+            log.info(f"[EARN] {ticker}: Direction set to {earn_direction.value} "
+                     f"(from earnings flow: bull=${bull_prem:,.0f} bear=${bear_prem:,.0f})")
+
+            if not earnings_date:
+                earnings_date = self._earnings_watchlist.get(ticker)
+            if not earnings_date:
+                try:
+                    if result.catalyst.next_earnings_date:
+                        earnings_date = result.catalyst.next_earnings_date
+                except AttributeError:
+                    pass
+            if not earnings_date:
+                log.info(f"[EARN] {ticker}: No earnings date found — skipping trade plan")
+                return
+
+            persistence.save_signal(result, mode="earnings", regime=regime,
+                                    flow_contradicts=_flow_contradicts(result))
+
+            send_earnings_telegram_alert(ticker, earnings_prints, result, earnings_date)
+
+        except Exception as e:
+            log.error(f"[EARN] Analysis failed for {ticker}: {e}")
+
+    async def _paper_position_loop(self):
+        broker = _get_broker_module()
+        interval = 30 if BROKER == "ib" else 15
+        while self._running:
+            try:
+                await asyncio.sleep(interval)
+                await asyncio.to_thread(broker.check_and_manage_positions)
             except Exception as e:
                 log.error(f"[LIVE] Paper position check error: {e}")
 
     async def _eod_report_loop(self):
-        from paper_trader import send_eod_report
-        from datetime import timezone, timedelta
-        et = timezone(timedelta(hours=-4))
+        broker = _get_broker_module()
+        from zoneinfo import ZoneInfo
+        et = ZoneInfo("America/New_York")
         while self._running:
             try:
                 now_et = datetime.now(et)
@@ -3266,28 +3894,31 @@ class LiveMonitor:
                 wait_secs = (target - now_et).total_seconds()
                 log.info(f"[LIVE] EOD report scheduled in {wait_secs/3600:.1f}h ({target.strftime('%H:%M ET')})")
                 await asyncio.sleep(wait_secs)
-                await asyncio.to_thread(send_eod_report)
+                await asyncio.to_thread(broker.send_eod_report)
             except Exception as e:
                 log.error(f"[LIVE] EOD report error: {e}")
                 await asyncio.sleep(60)
 
     async def _trade_stream_loop(self):
-        from paper_trader import start_trade_stream
-        while self._running:
-            try:
-                log.info("[LIVE] 🔴 Starting Alpaca real-time trade stream")
-                await start_trade_stream()
-            except Exception as e:
-                log.error(f"[LIVE] Trade stream error (reconnecting in 5s): {e}")
-                await asyncio.sleep(5)
-
-    async def _option_stream_loop(self):
-        from paper_trader import start_option_stream
+        broker = _get_broker_module()
         backoff = 5
         while self._running:
             try:
-                log.info("[LIVE] 📊 Starting real-time option quote stream")
-                await start_option_stream()
+                log.info(f"[LIVE] 🔴 Starting {BROKER.upper()} real-time trade stream")
+                await broker.start_trade_stream()
+                backoff = 5
+            except Exception as e:
+                log.error(f"[LIVE] Trade stream error (reconnecting in {backoff}s): {e}")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
+
+    async def _option_stream_loop(self):
+        broker = _get_broker_module()
+        backoff = 5
+        while self._running:
+            try:
+                log.info(f"[LIVE] 📊 Starting {BROKER.upper()} real-time option quote stream")
+                await broker.start_option_stream()
                 backoff = 5
             except ValueError as e:
                 if "connection limit" in str(e).lower():
@@ -3295,11 +3926,13 @@ class LiveMonitor:
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, 60)
                 else:
-                    log.error(f"[LIVE] Option stream auth error (retrying in 5s): {e}")
-                    await asyncio.sleep(5)
+                    log.error(f"[LIVE] Option stream auth error (retrying in {backoff}s): {e}")
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 60)
             except Exception as e:
-                log.error(f"[LIVE] Option stream error (reconnecting in 5s): {e}")
-                await asyncio.sleep(5)
+                log.error(f"[LIVE] Option stream error (reconnecting in {backoff}s): {e}")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
 
     async def run(self):
         try:
@@ -3317,14 +3950,14 @@ class LiveMonitor:
         log.info(f"[LIVE] 🟢 ChainSignal LIVE MONITOR starting")
         log.info(f"[LIVE] Filters: min_premium=${self.min_premium:,} | min_conviction={self.min_conviction} | cooldown={self.cooldown_minutes}min")
         log.info(f"[LIVE] Telegram: {'ON' if self.send_telegram else 'OFF'}")
-        log.info(f"[LIVE] Paper trading: {'ON' if self.paper_trade else 'OFF'}")
+        log.info(f"[LIVE] Paper trading: {'ON (' + BROKER.upper() + ')' if self.paper_trade else 'OFF'}")
         log.info(f"[LIVE] ETF filter: {len(ETF_BLACKLIST)} tickers excluded")
         log.info(f"[LIVE] {'='*50}")
 
         if self.send_telegram and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
             try:
-                from paper_trader import get_open_positions
-                open_pos = get_open_positions() if self.paper_trade else []
+                broker = _get_broker_module()
+                open_pos = broker.get_open_positions() if self.paper_trade else []
                 pos_line = f"Open positions: {len(open_pos)}" if self.paper_trade else "Paper: OFF"
                 httpx.post(
                     f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
@@ -3332,6 +3965,8 @@ class LiveMonitor:
                         f"🟢 ChainSignal started\n"
                         f"Paper: {'ON' if self.paper_trade else 'OFF'} | {pos_line}\n"
                         f"LEAP scanner: ON (180+ DTE, $300K+ accum)\n"
+                        f"Earnings scanner: ON (3-14d out, $200K+ accum)\n"
+                        f"Exit flow detection: ON ($100K+ bid-side)\n"
                         f"Telegram: ON | Cooldown: {self.cooldown_minutes}min",
                         "disable_web_page_preview": True},
                     timeout=10,
@@ -3347,6 +3982,11 @@ class LiveMonitor:
 
         asyncio.ensure_future(self._leap_scan_loop())
         log.info("[LIVE] 🔭 LEAP scan loop started (checks every 30min)")
+
+        asyncio.ensure_future(self._earnings_watchlist_loop())
+        asyncio.ensure_future(self._earnings_scan_loop())
+        log.info("[LIVE] 📊 Earnings scanner started (watchlist daily 8AM ET, scan every 30min)")
+        log.info("[LIVE] ⚠️ Exit flow detection active ($100K+ bid-side on held positions)")
 
         while self._running:
             try:
@@ -3434,7 +4074,9 @@ def main():
                         choices=["NONE", "LOW", "MEDIUM", "HIGH", "VERY_HIGH"],
                         help="Minimum conviction to trigger Telegram alert (default: MEDIUM)")
     parser.add_argument("--paper", action="store_true",
-                        help="Enable Webull paper trading in live mode")
+                        help="Enable paper trading in live mode")
+    parser.add_argument("--broker", type=str, choices=["alpaca", "ib"],
+                        default=None, help="Broker for paper trading (default: BROKER env var)")
     parser.add_argument("--backtest", action="store_true",
                         help="Run historical backtest over date range")
     parser.add_argument("--start-date", type=str, help="Backtest start date (YYYY-MM-DD)")
@@ -3447,6 +4089,10 @@ def main():
                         choices=["NONE", "LOW", "MEDIUM", "HIGH", "VERY_HIGH"],
                         help="Min conviction to record a trade in backtest (default: LOW)")
     args = parser.parse_args()
+
+    if args.broker:
+        global BROKER
+        BROKER = args.broker.lower()
 
     if args.telegram and (not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID):
         print("ERROR: Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env")

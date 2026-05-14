@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import asyncio
 import logging
+import threading
 from datetime import datetime
 from dataclasses import dataclass, asdict
 from typing import Optional
@@ -27,6 +28,8 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
+
+MAX_POSITION_COST = float(os.getenv("MAX_POSITION_COST", "3000"))
 
 _trading_client = None
 _data_client = None
@@ -88,8 +91,8 @@ def _get_spy_daily_return() -> Optional[float]:
         bars = sdc.get_stock_bars(StockBarsRequest(
             symbol_or_symbols=["SPY"], timeframe=TimeFrame.Day, limit=2))
         spy_bars = bars.get("SPY") or bars.data.get("SPY")
-        if spy_bars and len(spy_bars) >= 1:
-            prev_close = float(spy_bars[-1].close)
+        if spy_bars and len(spy_bars) >= 2:
+            prev_close = float(spy_bars[-2].close)
             if prev_close > 0:
                 return round((current - prev_close) / prev_close * 100, 2)
     except Exception as e:
@@ -100,28 +103,44 @@ def _get_spy_daily_return() -> Optional[float]:
 def _progressive_stop(peak_pnl_pct: float) -> Optional[float]:
     """Return the stop-loss floor based on how far the position has peaked.
 
-    Progressive ratchet:
-      Peak +10%  → stop at 0% (breakeven)
-      Peak +20%  → stop at +10%
-      Peak +30%  → trail 15% from peak
-      Peak +50%  → trail 10% from peak
-      Peak +80%  → trail 7% from peak
-      Peak +100% → trail 5% from peak
+    Linearly interpolates between tier boundaries so the floor tightens
+    smoothly as the peak grows — no more flat zones where 17 points of
+    profit can evaporate (e.g. +27% peak with only a +10% floor).
+
+    Tier anchors (floor at each boundary):
+      Peak +10%  → 0%    (breakeven)
+      Peak +20%  → +10%
+      Peak +30%  → +25.5%  (15% trail)
+      Peak +50%  → +45%    (10% trail)
+      Peak +80%  → +74.4%  (7% trail)
+      Peak +100% → +95%    (5% trail)
+      Above 100% → 5% trail from peak
+
     Returns None if peak hasn't reached +10%.
     """
+    if peak_pnl_pct < 10:
+        return None
+
     if peak_pnl_pct >= 100:
         return peak_pnl_pct - (peak_pnl_pct * 0.05)
-    if peak_pnl_pct >= 80:
-        return peak_pnl_pct - (peak_pnl_pct * 0.07)
-    if peak_pnl_pct >= 50:
-        return peak_pnl_pct - (peak_pnl_pct * 0.10)
-    if peak_pnl_pct >= 30:
-        return peak_pnl_pct - (peak_pnl_pct * 0.15)
-    if peak_pnl_pct >= 20:
-        return 10.0
-    if peak_pnl_pct >= 10:
-        return 0.0
-    return None
+
+    tiers = [
+        (10,  0.0),
+        (20,  10.0),
+        (30,  30 * 0.85),    # 25.5
+        (50,  50 * 0.90),    # 45.0
+        (80,  80 * 0.93),    # 74.4
+        (100, 100 * 0.95),   # 95.0
+    ]
+
+    for i in range(len(tiers) - 1):
+        lo_peak, lo_floor = tiers[i]
+        hi_peak, hi_floor = tiers[i + 1]
+        if peak_pnl_pct < hi_peak:
+            t = (peak_pnl_pct - lo_peak) / (hi_peak - lo_peak)
+            return lo_floor + t * (hi_floor - lo_floor)
+
+    return tiers[-1][1]
 
 
 def _get_alpaca_tickers(tc) -> set[str]:
@@ -228,15 +247,18 @@ class PaperPosition:
     pnl_pct: Optional[float] = None
     strategy_type: str = "SWING"
     market_return_pct: Optional[float] = None
+    es_overnight_pct: Optional[float] = None
+    broker: str = "alpaca"
 
 
 _positions: list[PaperPosition] = []
 _positions_loaded: bool = False
+_pos_lock = threading.Lock()
 
 
 def _load_positions():
     global _positions, _positions_loaded
-    data = load_paper_positions()
+    data = load_paper_positions(broker="alpaca")
     if data is None:
         log.warning("[PAPER] Supabase load failed — will retry next cycle")
         return
@@ -294,7 +316,7 @@ def place_paper_trade(result) -> Optional[PaperPosition]:
         log.info("[PAPER] %s: Already has open swing position in local tracking — skipping duplicate", result.ticker)
         return None
 
-    # Position cap: 1-3 MEDIUM+, 4-8 HIGH+ only, hard cap at 8
+    # Position cap: 0-2 MEDIUM+, 3-8 HIGH+ only, hard cap at 8
     MAX_POSITIONS = 8
     HIGH_ONLY_THRESHOLD = 3
     open_count = sum(1 for p in _positions if p.status in ("PENDING", "FILLED"))
@@ -325,13 +347,22 @@ def place_paper_trade(result) -> Optional[PaperPosition]:
         log.warning("[PAPER] %s: Could not get market price for %s — using estimate $%.2f",
                     result.ticker, occ_symbol, limit_price)
 
+    quantity = 1
+    if MAX_POSITION_COST > 0:
+        cost_per = limit_price * 100
+        quantity = max(1, int(MAX_POSITION_COST / cost_per))
+        if cost_per > MAX_POSITION_COST:
+            log.warning("[PAPER] %s: Single contract $%.0f exceeds position cap $%.0f — SKIPPING",
+                        result.ticker, cost_per, MAX_POSITION_COST)
+            return None
+
     pos = PaperPosition(
         ticker=result.ticker,
         direction=result.direction.value,
         option_type=option_type,
         strike=strike,
         expiry=expiry[:10],
-        quantity=1,
+        quantity=quantity,
         limit_price=limit_price,
         occ_symbol=occ_symbol,
         premium_target_pct=tp.premium_target_pct or 50.0,
@@ -352,7 +383,7 @@ def place_paper_trade(result) -> Optional[PaperPosition]:
 
         order_req = LimitOrderRequest(
             symbol=occ_symbol,
-            qty=1,
+            qty=quantity,
             side=OrderSide.BUY,
             time_in_force=TimeInForce.GTC,
             limit_price=limit_price,
@@ -401,23 +432,40 @@ def place_paper_trade(result) -> Optional[PaperPosition]:
             close_reason=str(e),
         )
 
-    if not _positions_loaded:
-        _load_positions()
-    _positions.append(pos)
-    _save_positions()
+    with _pos_lock:
+        if not _positions_loaded:
+            _load_positions()
+        _positions.append(pos)
+        _save_positions()
     return pos if pos.status != "REJECTED" else None
 
 
-def check_and_manage_positions():
-    """Check all open positions, update fills, and manage exits."""
+def check_and_manage_positions(ticker: str = None):
+    """Check open positions, update fills, and manage exits.
+
+    If ticker is provided, only check positions for that ticker (used by
+    UW websocket event-driven monitoring for low-latency exit checks).
+    Acquires _pos_lock to serialize with async quote/trade handlers.
+    """
     tc = _get_trading_client()
     if not tc:
         return
 
+    with _pos_lock:
+        _check_and_manage_positions_inner(tc, ticker)
+
+
+def _check_and_manage_positions_inner(tc, ticker: str = None):
     if not _positions_loaded:
         _load_positions()
 
     open_positions = [p for p in _positions if p.status in ("PENDING", "FILLED")]
+    if ticker:
+        match_tickers = {ticker}
+        alt = SAME_COMPANY_TICKERS.get(ticker)
+        if alt:
+            match_tickers.add(alt)
+        open_positions = [p for p in open_positions if p.ticker in match_tickers]
     if not open_positions:
         return
 
@@ -434,6 +482,8 @@ def check_and_manage_positions():
 
             current_price = _get_current_option_price(pos)
             if current_price is None:
+                log.warning("[PAPER] %s: Price unavailable — position UNMANAGED this cycle (%s)",
+                            pos.ticker, pos.occ_symbol)
                 continue
 
             entry = pos.filled_price
@@ -670,6 +720,7 @@ def check_flow_contradiction(result, min_conviction: str = "MEDIUM"):
     min_conv_idx = (conviction_order.index(min_conviction)
                     if min_conviction in conviction_order else 2)
 
+    actions = []
     for pos in held:
         pos_is_bull = pos.direction == "BULLISH"
 
@@ -695,43 +746,76 @@ def check_flow_contradiction(result, min_conviction: str = "MEDIUM"):
             reason = (f"conviction collapsed: {result.conviction} "
                       f"(score={result.composite_score:.0f}, direction={new_dir.value})")
 
-        tc = _get_trading_client()
-        if not tc:
-            return
-
         if pos.status == "PENDING":
-            try:
-                tc.cancel_order_by_id(pos.order_id)
+            actions.append(("cancel", pos, reason, None))
+        else:
+            current_price = _get_current_option_price(pos)
+            if current_price is None:
+                log.warning("[PAPER] %s: Cannot get price for contradiction close", pos.ticker)
+                continue
+            actions.append(("close", pos, reason, current_price))
+
+    if not actions:
+        return
+
+    tc = _get_trading_client()
+    if not tc:
+        return
+
+    # Two-phase: mark positions under lock, execute blocking sells outside.
+    cancel_queue = []
+    close_queue = []
+
+    with _pos_lock:
+        for action, pos, reason, price in actions:
+            if pos.status not in ("PENDING", "FILLED"):
+                continue
+
+            if action == "cancel":
+                cancel_queue.append((pos, reason))
+
+            elif action == "close":
+                _finalize_close(pos, price, reason)
+                close_queue.append((pos, price, reason))
+
+        if close_queue:
+            _save_positions()
+
+    for pos, reason in cancel_queue:
+        try:
+            tc.cancel_order_by_id(pos.order_id)
+            with _pos_lock:
                 pos.status = "CLOSED"
                 pos.close_reason = reason
                 pos.closed_at = datetime.now().isoformat()
-                log.info("[PAPER] %s: Cancelled PENDING order — %s", pos.ticker, reason)
-                log_paper_event(
-                    pos.order_id, pos.ticker, "FLOW_CONTRADICTION",
-                    direction=pos.direction, option_type=pos.option_type,
-                    strike=pos.strike, expiry=pos.expiry,
-                    close_reason=reason,
-                    metadata={"new_direction": new_dir.value,
-                              "new_conviction": result.conviction,
-                              "new_score": result.composite_score},
-                )
-                _send_paper_telegram(
-                    f"⚠️ <b>FLOW CONTRADICTION — ORDER CANCELLED</b>\n"
-                    f"{pos.ticker} {pos.option_type} ${pos.strike:.0f} exp {pos.expiry}\n"
-                    f"{reason}"
-                )
-            except Exception as e:
-                log.error("[PAPER] %s: Failed to cancel on contradiction: %s", pos.ticker, e)
-            continue
+                _save_positions()
+            log.info("[PAPER] %s: Cancelled PENDING order — %s", pos.ticker, reason)
+            log_paper_event(
+                pos.order_id, pos.ticker, "FLOW_CONTRADICTION",
+                direction=pos.direction, option_type=pos.option_type,
+                strike=pos.strike, expiry=pos.expiry,
+                close_reason=reason,
+                metadata={"new_direction": new_dir.value,
+                          "new_conviction": result.conviction,
+                          "new_score": result.composite_score},
+            )
+            _send_paper_telegram(
+                f"⚠️ <b>FLOW CONTRADICTION — ORDER CANCELLED</b>\n"
+                f"{pos.ticker} {pos.option_type} ${pos.strike:.0f} exp {pos.expiry}\n"
+                f"{reason}"
+            )
+        except Exception as e:
+            log.error("[PAPER] %s: Failed to cancel on contradiction: %s", pos.ticker, e)
 
-        current_price = _get_current_option_price(pos)
-        if current_price is None:
-            log.warning("[PAPER] %s: Cannot get price for contradiction close", pos.ticker)
-            continue
-
-        _close_position(tc, pos, current_price, reason)
-
-    _save_positions()
+    for pos, price, reason in close_queue:
+        fill_price = _submit_alpaca_sell(tc, pos)
+        if fill_price and abs(fill_price - price) > 0.005:
+            with _pos_lock:
+                pos.close_price = fill_price
+                if pos.filled_price:
+                    pos.pnl_pct = round(
+                        (fill_price - pos.filled_price) / pos.filled_price * 100, 2)
+                _save_positions()
 
 
 def _reason_to_event_type(reason: str) -> str:
@@ -740,6 +824,10 @@ def _reason_to_event_type(reason: str) -> str:
         return "FLOW_CONTRADICTION"
     if "profit target" in r:
         return "TP_HIT"
+    if "progressive stop" in r:
+        return "PROGRESSIVE_STOP"
+    if "breakeven stop" in r:
+        return "BREAKEVEN_STOP"
     if "hard stop" in r:
         return "HARD_STOP"
     if "trailing stop" in r:
@@ -753,28 +841,50 @@ def _reason_to_event_type(reason: str) -> str:
     return "CLOSED"
 
 
-def _close_position(tc, pos: PaperPosition, current_price: float, reason: str):
-    """Close a position via Alpaca."""
+def _submit_alpaca_sell(tc, pos: PaperPosition) -> Optional[float]:
+    """Submit Alpaca close and poll for fill. Returns fill price or None.
+
+    BLOCKING (up to ~5s). Must NOT be called while holding _pos_lock.
+    """
+    import time as _time
     try:
-        tc.close_position(symbol_or_asset_id=pos.occ_symbol)
+        close_order = tc.close_position(symbol_or_asset_id=pos.occ_symbol)
+        if close_order and hasattr(close_order, 'id'):
+            order_id = str(close_order.id)
+            for _ in range(10):
+                _time.sleep(0.5)
+                try:
+                    o = tc.get_order_by_id(order_id)
+                    if o.status and str(o.status).lower() == 'filled':
+                        if o.filled_avg_price and float(o.filled_avg_price) > 0:
+                            return float(o.filled_avg_price)
+                        break
+                except Exception:
+                    break
     except Exception as e:
         err_str = str(e).lower()
         if "not found" in err_str or "404" in err_str or "no position" in err_str:
-            log.warning("[PAPER] %s: Position already gone on Alpaca — marking closed locally", pos.ticker)
+            log.warning("[PAPER] %s: Position already gone on Alpaca", pos.ticker)
         else:
             log.error("[PAPER] Failed to close %s via Alpaca: %s", pos.ticker, e)
-            return
+    return None
 
+
+def _finalize_close(pos: PaperPosition, exit_price: float, reason: str):
+    """Record close bookkeeping, log event, send Telegram.
+
+    Does NOT submit a sell order — call _submit_alpaca_sell separately.
+    """
     pos.status = "CLOSED"
     pos.close_reason = reason
-    pos.close_price = current_price
+    pos.close_price = exit_price
     pos.closed_at = datetime.now().isoformat()
     if pos.filled_price:
-        pos.pnl_pct = round((current_price - pos.filled_price) / pos.filled_price * 100, 2)
+        pos.pnl_pct = round((exit_price - pos.filled_price) / pos.filled_price * 100, 2)
 
     log.info(
         "[PAPER] %s: CLOSED — %s | entry=$%.2f exit=$%.2f pnl=%s%%",
-        pos.ticker, reason, pos.filled_price or 0, current_price,
+        pos.ticker, reason, pos.filled_price or 0, exit_price,
         f"{pos.pnl_pct:+.1f}" if pos.pnl_pct is not None else "?"
     )
 
@@ -783,16 +893,16 @@ def _close_position(tc, pos: PaperPosition, current_price: float, reason: str):
         pos.order_id, pos.ticker, event_type,
         direction=pos.direction, option_type=pos.option_type,
         strike=pos.strike, expiry=pos.expiry,
-        price=current_price, filled_price=pos.filled_price,
+        price=exit_price, filled_price=pos.filled_price,
         pnl_pct=pos.pnl_pct, peak_premium=pos.peak_premium,
         trail_active=pos.trail_active, close_reason=reason,
     )
     pnl_emoji = "🟢" if pos.pnl_pct and pos.pnl_pct > 0 else "🔴"
     entry_str = f"${pos.filled_price:.2f}" if pos.filled_price is not None else "N/A"
     pnl_str = f"{pos.pnl_pct:+.1f}%" if pos.pnl_pct is not None else "?%"
-    pnl_dollar = (current_price - pos.filled_price) * (pos.quantity or 1) * 100 if pos.filled_price else 0
+    pnl_dollar = (exit_price - pos.filled_price) * (pos.quantity or 1) * 100 if pos.filled_price else 0
     cost_dollar = (pos.filled_price or 0) * (pos.quantity or 1) * 100
-    exit_dollar = current_price * (pos.quantity or 1) * 100
+    exit_dollar = exit_price * (pos.quantity or 1) * 100
     peak_str = ""
     if pos.peak_premium and pos.filled_price:
         peak_pnl = (pos.peak_premium - pos.filled_price) / pos.filled_price * 100
@@ -801,11 +911,26 @@ def _close_position(tc, pos: PaperPosition, current_price: float, reason: str):
     _send_paper_telegram(
         f"{pnl_emoji} <b>PAPER TRADE CLOSED</b>\n"
         f"{pos.ticker} {pos.option_type} ${pos.strike:.0f} exp {pos.expiry}\n"
-        f"Entry: {entry_str} (${cost_dollar:,.0f}) → Exit: ${current_price:.2f} (${exit_dollar:,.0f})\n"
+        f"Entry: {entry_str} (${cost_dollar:,.0f}) → Exit: ${exit_price:.2f} (${exit_dollar:,.0f})\n"
         f"PnL: {pnl_str} / ${pnl_dollar:+,.0f}"
         f"{peak_str}\n"
         f"Reason: {reason}"
     )
+
+
+def _close_position(tc, pos: PaperPosition, current_price: float, reason: str):
+    """Full blocking close: submit sell, poll fill, record bookkeeping.
+
+    Used by poll path and flow contradiction. The streaming path uses
+    _finalize_close + _submit_alpaca_sell separately to avoid holding
+    _pos_lock during the blocking sell.
+    """
+    fill_price = _submit_alpaca_sell(tc, pos)
+    exit_price = fill_price if fill_price else current_price
+    if fill_price:
+        log.info("[PAPER] %s: Sell filled at $%.2f (trigger quote was $%.2f, diff=$%.2f)",
+                 pos.ticker, fill_price, current_price, fill_price - current_price)
+    _finalize_close(pos, exit_price, reason)
 
 
 def place_leap_trade(result, trade_plan) -> Optional[PaperPosition]:
@@ -845,7 +970,7 @@ def place_leap_trade(result, trade_plan) -> Optional[PaperPosition]:
         log.info("[LEAP] %s: Already has open LEAP position in local tracking — skipping duplicate", result.ticker)
         return None
 
-    # Position cap: 1-3 MEDIUM+, 4-8 HIGH+ only, hard cap at 8
+    # Position cap: 0-2 MEDIUM+, 3-8 HIGH+ only, hard cap at 8
     MAX_POSITIONS = 8
     HIGH_ONLY_THRESHOLD = 3
     open_count = sum(1 for p in _positions if p.status in ("PENDING", "FILLED"))
@@ -857,6 +982,15 @@ def place_leap_trade(result, trade_plan) -> Optional[PaperPosition]:
                  result.ticker, open_count, result.conviction)
         return None
 
+    leap_qty = 1
+    if MAX_POSITION_COST > 0:
+        cost_per = mid_price * 100
+        if cost_per > MAX_POSITION_COST:
+            log.warning("[LEAP] %s: Single contract $%.0f exceeds position cap $%.0f — SKIPPING",
+                        result.ticker, cost_per, MAX_POSITION_COST)
+            return None
+        leap_qty = max(1, int(MAX_POSITION_COST / cost_per))
+
     MAX_LEAP_ALLOCATION = 0.20
     try:
         acct = tc.get_account()
@@ -866,7 +1000,7 @@ def place_leap_trade(result, trade_plan) -> Optional[PaperPosition]:
             for p in _positions
             if p.status in ("PENDING", "FILLED") and p.strategy_type == "LEAP"
         )
-        new_cost = mid_price * 100
+        new_cost = mid_price * 100 * leap_qty
         if (leap_exposure + new_cost) / equity > MAX_LEAP_ALLOCATION:
             log.info(
                 "[LEAP] %s: Would exceed 20%% LEAP allocation "
@@ -884,7 +1018,7 @@ def place_leap_trade(result, trade_plan) -> Optional[PaperPosition]:
         option_type=option_type,
         strike=strike,
         expiry=expiry[:10],
-        quantity=1,
+        quantity=leap_qty,
         limit_price=mid_price,
         occ_symbol=occ_symbol,
         strategy_type="LEAP",
@@ -906,7 +1040,7 @@ def place_leap_trade(result, trade_plan) -> Optional[PaperPosition]:
 
         order_req = LimitOrderRequest(
             symbol=occ_symbol,
-            qty=1,
+            qty=leap_qty,
             side=OrderSide.BUY,
             time_in_force=TimeInForce.GTC,
             limit_price=mid_price,
@@ -955,10 +1089,11 @@ def place_leap_trade(result, trade_plan) -> Optional[PaperPosition]:
             close_reason=str(e),
         )
 
-    if not _positions_loaded:
-        _load_positions()
-    _positions.append(pos)
-    _save_positions()
+    with _pos_lock:
+        if not _positions_loaded:
+            _load_positions()
+        _positions.append(pos)
+        _save_positions()
     return pos if pos.status != "REJECTED" else None
 
 
@@ -968,7 +1103,7 @@ def get_portfolio_summary() -> dict:
         _load_positions()
 
     open_pos = [p for p in _positions if p.status == "FILLED"]
-    closed_rows = load_closed_paper_positions()
+    closed_rows = load_closed_paper_positions(broker="alpaca")
     closed_pnls = [float(r["pnl_pct"]) for r in closed_rows]
     wins = [p for p in closed_pnls if p > 0]
     losses = [p for p in closed_pnls if p <= 0]
@@ -987,9 +1122,9 @@ def get_portfolio_summary() -> dict:
 
 def send_eod_report():
     """Send end-of-day P&L report via Telegram."""
-    from datetime import timezone, timedelta
+    from zoneinfo import ZoneInfo
 
-    et = timezone(timedelta(hours=-4))
+    et = ZoneInfo("America/New_York")
     now_et = datetime.now(et)
     today_start = now_et.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
 
@@ -997,8 +1132,10 @@ def send_eod_report():
         _load_positions()
 
     # --- Realized P&L (closed today) ---
-    closed_today = load_closed_paper_positions_since(today_start)
-    closed_today = [c for c in closed_today if c.get("close_reason") not in ("canceled", "cancelled", "expired")]
+    closed_today = load_closed_paper_positions_since(today_start, broker="alpaca")
+    closed_today = [c for c in closed_today
+                    if c.get("filled_price") is not None
+                    and c.get("pnl_pct") is not None]
 
     realized_lines = []
     total_realized = 0.0
@@ -1045,7 +1182,7 @@ def send_eod_report():
         pass
 
     # --- All-time stats ---
-    all_closed = load_closed_paper_positions()
+    all_closed = load_closed_paper_positions(broker="alpaca")
     all_pnls = [float(r["pnl_pct"]) for r in all_closed]
     wins = [p for p in all_pnls if p > 0]
     losses = [p for p in all_pnls if p <= 0]
@@ -1089,7 +1226,11 @@ def _sync_save():
 
 
 async def _handle_trade_update(data):
-    """Process a real-time trade update from Alpaca's trading stream."""
+    """Process a real-time trade update from Alpaca's trading stream.
+
+    All position mutations go through _pos_lock via run_in_executor to
+    serialize with the threaded check_and_manage_positions path.
+    """
     try:
         event = str(getattr(data, "event", "") or "")
         order_obj = getattr(data, "order", None)
@@ -1099,23 +1240,31 @@ async def _handle_trade_update(data):
         if not order_id:
             return
 
-        if not _positions_loaded:
-            _load_positions()
-
-        pos = next((p for p in _positions if p.order_id == order_id), None)
-        if not pos:
-            return
-
         now = datetime.now()
         loop = asyncio.get_event_loop()
 
         if event == "fill":
             raw_price = getattr(order_obj, "filled_avg_price", None)
-            avg_price = float(raw_price) if raw_price else pos.limit_price
-            pos.status = "FILLED"
-            pos.filled_price = avg_price
-            pos.filled_at = now.isoformat()
-            pos.peak_premium = avg_price
+
+            def _apply_fill():
+                with _pos_lock:
+                    if not _positions_loaded:
+                        _load_positions()
+                    pos = next((p for p in _positions if p.order_id == order_id), None)
+                    if not pos or pos.status != "PENDING":
+                        return None
+                    avg_price = float(raw_price) if raw_price else pos.limit_price
+                    pos.status = "FILLED"
+                    pos.filled_price = avg_price
+                    pos.filled_at = now.isoformat()
+                    pos.peak_premium = avg_price
+                    _save_positions()
+                    return pos
+
+            pos = await loop.run_in_executor(None, _apply_fill)
+            if not pos:
+                return
+
             if pos.strategy_type == "LEAP":
                 try:
                     from alpaca.data.requests import StockLatestQuoteRequest
@@ -1128,31 +1277,51 @@ async def _handle_trade_update(data):
                         if stock_quote:
                             bid = float(stock_quote.bid_price or 0)
                             ask = float(stock_quote.ask_price or 0)
-                            if bid > 0 and ask > 0:
-                                pos.underlying_entry = (bid + ask) / 2
-                            elif bid > 0 or ask > 0:
-                                pos.underlying_entry = max(bid, ask)
+                            def _update_underlying():
+                                with _pos_lock:
+                                    if bid > 0 and ask > 0:
+                                        pos.underlying_entry = (bid + ask) / 2
+                                    elif bid > 0 or ask > 0:
+                                        pos.underlying_entry = max(bid, ask)
+                                    else:
+                                        return
+                                    _save_positions()
+                            await loop.run_in_executor(None, _update_underlying)
                 except Exception as e:
                     log.error("[PAPER] %s: Failed to update underlying on fill: %s", pos.ticker, e)
-            log.info("[PAPER] %s: FILLED @ $%.2f (real-time)", pos.ticker, avg_price)
+
+            log.info("[PAPER] %s: FILLED @ $%.2f (real-time)", pos.ticker, pos.filled_price)
             await loop.run_in_executor(None, lambda: log_paper_event(
                 pos.order_id, pos.ticker, "FILL",
                 direction=pos.direction, option_type=pos.option_type,
                 strike=pos.strike, expiry=pos.expiry,
-                filled_price=avg_price, price=avg_price,
+                filled_price=pos.filled_price, price=pos.filled_price,
             ))
             await loop.run_in_executor(None, lambda: _send_paper_telegram(
                 f"✅ <b>PAPER FILL</b>\n"
                 f"{pos.ticker} {pos.option_type} ${pos.strike:.0f} exp {pos.expiry}\n"
-                f"Filled @ ${avg_price:.2f}"
+                f"Filled @ ${pos.filled_price:.2f}"
             ))
-            await loop.run_in_executor(None, _sync_save)
             await _subscribe_option_quotes([pos.occ_symbol])
 
         elif event in ("canceled", "expired", "rejected"):
-            pos.status = "CLOSED"
-            pos.close_reason = event
-            pos.closed_at = now.isoformat()
+            def _apply_cancel():
+                with _pos_lock:
+                    if not _positions_loaded:
+                        _load_positions()
+                    pos = next((p for p in _positions if p.order_id == order_id), None)
+                    if not pos or pos.status != "PENDING":
+                        return None
+                    pos.status = "CLOSED"
+                    pos.close_reason = event
+                    pos.closed_at = now.isoformat()
+                    _save_positions()
+                    return pos
+
+            pos = await loop.run_in_executor(None, _apply_cancel)
+            if not pos:
+                return
+
             log.info("[PAPER] %s: Order %s (real-time)", pos.ticker, event.upper())
             await loop.run_in_executor(None, lambda: log_paper_event(
                 pos.order_id, pos.ticker, f"ORDER_{event.upper()}",
@@ -1160,14 +1329,18 @@ async def _handle_trade_update(data):
                 strike=pos.strike, expiry=pos.expiry,
                 close_reason=event,
             ))
-            await loop.run_in_executor(None, _sync_save)
 
     except Exception as e:
         log.error("[PAPER] Trade stream event error: %s", e)
 
 
 async def _handle_option_quote(data):
-    """Process real-time option quote — run exit checks instantly."""
+    """Process real-time option quote — run exit checks instantly.
+
+    Two-phase close: ALL position reads, updates, and exit condition checks
+    happen under _pos_lock (fast). Broker sell orders execute outside the
+    lock (slow, up to 5s) to avoid blocking other positions.
+    """
     try:
         symbol = str(getattr(data, "symbol", "") or "")
         if not symbol:
@@ -1179,58 +1352,109 @@ async def _handle_option_quote(data):
             return
         current_price = round((bid + ask) / 2, 2) if (bid > 0 and ask > 0) else max(bid, ask)
 
-        if not _positions_loaded:
-            _load_positions()
-
-        pos = next((p for p in _positions
-                     if p.occ_symbol == symbol and p.status == "FILLED" and p.filled_price),
-                    None)
-        if not pos:
-            return
-
-        entry = pos.filled_price
-        pnl_pct = (current_price - entry) / entry * 100
-
-        if pos.peak_premium is None or current_price > pos.peak_premium:
-            pos.peak_premium = current_price
-        if pos.trough_premium is None or current_price < pos.trough_premium:
-            pos.trough_premium = current_price
-
-        # Progressive stop ratchet (non-LEAP only)
-        if pos.strategy_type != "LEAP" and pos.peak_premium:
-            peak_pnl = (pos.peak_premium - entry) / entry * 100
-            new_floor = _progressive_stop(peak_pnl)
-            if new_floor is not None and new_floor > pos.premium_stop_pct:
-                old_stop = pos.premium_stop_pct
-                pos.premium_stop_pct = new_floor
-                log.info("[PAPER] %s: Stop ratcheted %.1f%% → %.1f%% (peak +%.1f%%)",
-                         pos.ticker, old_stop, new_floor, peak_pnl)
-
-        tc = _get_trading_client()
-        if not tc:
-            return
-
         now = datetime.now()
         loop = asyncio.get_event_loop()
 
-        async def _try_close(reason: str):
-            await loop.run_in_executor(
-                None, lambda: _close_position(tc, pos, current_price, reason))
-            if pos.status == "CLOSED":
-                await loop.run_in_executor(None, _sync_save)
-                await _unsubscribe_option_quotes([symbol])
-                return True
-            return False
+        def _check_and_mark():
+            """Under lock: find position, update state, check all exits, mark closed if needed."""
+            with _pos_lock:
+                if not _positions_loaded:
+                    _load_positions()
 
-        if pnl_pct <= pos.premium_stop_pct:
-            reason = (f"progressive stop ({pnl_pct:+.1f}%, floor was {pos.premium_stop_pct:+.1f}%)"
-                      if pos.premium_stop_pct > 0
-                      else f"breakeven stop ({pnl_pct:+.1f}%)" if pos.premium_stop_pct == 0.0
-                      else f"hard stop ({pnl_pct:+.1f}%)")
-            if await _try_close(reason):
-                return
+                pos = next((p for p in _positions
+                            if p.occ_symbol == symbol and p.status == "FILLED" and p.filled_price),
+                           None)
+                if not pos:
+                    return None, None, False
 
-        if pos.strategy_type == "LEAP" and pos.underlying_entry > 0:
+                entry = pos.filled_price
+                pnl_pct = (current_price - entry) / entry * 100
+
+                if pos.peak_premium is None or current_price > pos.peak_premium:
+                    pos.peak_premium = current_price
+                if pos.trough_premium is None or current_price < pos.trough_premium:
+                    pos.trough_premium = current_price
+
+                if pos.strategy_type != "LEAP" and pos.peak_premium:
+                    peak_pnl = (pos.peak_premium - entry) / entry * 100
+                    new_floor = _progressive_stop(peak_pnl)
+                    if new_floor is not None and new_floor > pos.premium_stop_pct:
+                        old_stop = pos.premium_stop_pct
+                        pos.premium_stop_pct = new_floor
+                        log.info("[PAPER] %s: Stop ratcheted %.1f%% → %.1f%% (peak +%.1f%%)",
+                                 pos.ticker, old_stop, new_floor, peak_pnl)
+
+                reason = None
+
+                if pnl_pct <= pos.premium_stop_pct:
+                    reason = (f"progressive stop ({pnl_pct:+.1f}%, floor was {pos.premium_stop_pct:+.1f}%)"
+                              if pos.premium_stop_pct > 0
+                              else f"breakeven stop ({pnl_pct:+.1f}%)" if pos.premium_stop_pct == 0.0
+                              else f"hard stop ({pnl_pct:+.1f}%)")
+                elif pnl_pct >= pos.premium_target_pct:
+                    reason = f"profit target ({pnl_pct:+.1f}%)"
+                else:
+                    if pnl_pct >= pos.trail_activate_pct and not pos.trail_active:
+                        pos.trail_active = True
+                        log_paper_event(
+                            pos.order_id, pos.ticker, "TRAIL_ACTIVATED",
+                            direction=pos.direction, option_type=pos.option_type,
+                            strike=pos.strike, expiry=pos.expiry,
+                            price=current_price, filled_price=pos.filled_price,
+                            pnl_pct=round(pnl_pct, 2), peak_premium=pos.peak_premium,
+                            trail_active=True,
+                        )
+
+                    if pos.trail_active and pos.peak_premium:
+                        drawdown = (pos.peak_premium - current_price) / pos.peak_premium * 100
+                        if drawdown >= pos.trail_stop_pct:
+                            reason = (f"trailing stop (peak=${pos.peak_premium:.2f}, "
+                                      f"drawdown={drawdown:.1f}%)")
+
+                    if not reason:
+                        hold_start = pos.filled_at or pos.opened_at
+                        if hold_start:
+                            days_held = (now - datetime.fromisoformat(hold_start)).days
+                            if days_held >= pos.theta_kill_days and abs(pnl_pct) < pos.theta_kill_move_pct:
+                                reason = f"theta kill (day {days_held}, move={pnl_pct:+.1f}%)"
+                            elif days_held >= pos.max_hold_days:
+                                reason = f"max hold ({days_held}d)"
+
+                need_leap_check = (not reason and pos.strategy_type == "LEAP"
+                                   and pos.underlying_entry > 0)
+
+                if reason:
+                    _finalize_close(pos, current_price, reason)
+                    _save_positions()
+
+                return pos, reason, need_leap_check
+
+        pos, reason, need_leap_check = await loop.run_in_executor(None, _check_and_mark)
+        if pos is None:
+            return
+
+        if reason:
+            tc = _get_trading_client()
+            if tc:
+                fill_price = await loop.run_in_executor(
+                    None, lambda: _submit_alpaca_sell(tc, pos))
+                if fill_price and abs(fill_price - current_price) > 0.005:
+                    def _update_fill():
+                        with _pos_lock:
+                            pos.close_price = fill_price
+                            if pos.filled_price:
+                                pos.pnl_pct = round(
+                                    (fill_price - pos.filled_price) / pos.filled_price * 100, 2)
+                            log.info("[PAPER] %s: Fill $%.2f vs trigger $%.2f (diff=$%.2f, P&L %s%%)",
+                                     pos.ticker, fill_price, current_price,
+                                     fill_price - current_price,
+                                     f"{pos.pnl_pct:+.1f}" if pos.pnl_pct is not None else "?")
+                            _save_positions()
+                    await loop.run_in_executor(None, _update_fill)
+            await _unsubscribe_option_quotes([symbol])
+            return
+
+        if need_leap_check:
             try:
                 from alpaca.data.requests import StockLatestQuoteRequest
                 sdc = _get_stock_data_client()
@@ -1243,48 +1467,42 @@ async def _handle_option_quote(data):
                         sbid = float(stock_quote.bid_price or 0)
                         sask = float(stock_quote.ask_price or 0)
                         if sbid > 0 or sask > 0:
-                            stock_price = (sbid + sask) / 2 if (sbid > 0 and sask > 0) else max(sbid, sask)
-                            stock_move_pct = (stock_price - pos.underlying_entry) / pos.underlying_entry * 100
+                            stock_price = ((sbid + sask) / 2
+                                           if (sbid > 0 and sask > 0) else max(sbid, sask))
+                            stock_move_pct = ((stock_price - pos.underlying_entry)
+                                              / pos.underlying_entry * 100)
                             is_bull = pos.direction == "BULLISH"
-                            if (is_bull and stock_move_pct <= -25) or (not is_bull and stock_move_pct >= 25):
-                                if await _try_close(
-                                        f"underlying stop ({pos.ticker} {stock_move_pct:+.1f}% "
-                                        f"from ${pos.underlying_entry:.2f})"):
-                                    return
+                            if ((is_bull and stock_move_pct <= -25)
+                                    or (not is_bull and stock_move_pct >= 25)):
+                                leap_reason = (
+                                    f"underlying stop ({pos.ticker} {stock_move_pct:+.1f}% "
+                                    f"from ${pos.underlying_entry:.2f})")
+                                def _close_leap():
+                                    with _pos_lock:
+                                        if pos.status != "FILLED":
+                                            return False
+                                        _finalize_close(pos, current_price, leap_reason)
+                                        _save_positions()
+                                        return True
+                                closed = await loop.run_in_executor(None, _close_leap)
+                                if closed:
+                                    tc = _get_trading_client()
+                                    if tc:
+                                        fill = await loop.run_in_executor(
+                                            None, lambda: _submit_alpaca_sell(tc, pos))
+                                        if fill and abs(fill - current_price) > 0.005:
+                                            def _upd():
+                                                with _pos_lock:
+                                                    pos.close_price = fill
+                                                    if pos.filled_price:
+                                                        pos.pnl_pct = round(
+                                                            (fill - pos.filled_price)
+                                                            / pos.filled_price * 100, 2)
+                                                    _save_positions()
+                                            await loop.run_in_executor(None, _upd)
+                                    await _unsubscribe_option_quotes([symbol])
             except Exception as e:
                 log.error("[PAPER] LEAP underlying check failed for %s: %s", pos.ticker, e)
-
-        if pnl_pct >= pos.premium_target_pct:
-            if await _try_close(f"profit target ({pnl_pct:+.1f}%)"):
-                return
-
-        if pnl_pct >= pos.trail_activate_pct and not pos.trail_active:
-            pos.trail_active = True
-            await loop.run_in_executor(None, lambda: log_paper_event(
-                pos.order_id, pos.ticker, "TRAIL_ACTIVATED",
-                direction=pos.direction, option_type=pos.option_type,
-                strike=pos.strike, expiry=pos.expiry,
-                price=current_price, filled_price=pos.filled_price,
-                pnl_pct=round(pnl_pct, 2), peak_premium=pos.peak_premium,
-                trail_active=True,
-            ))
-
-        if pos.trail_active and pos.peak_premium:
-            drawdown_from_peak = (pos.peak_premium - current_price) / pos.peak_premium * 100
-            if drawdown_from_peak >= pos.trail_stop_pct:
-                if await _try_close(
-                        f"trailing stop (peak=${pos.peak_premium:.2f}, drawdown={drawdown_from_peak:.1f}%)"):
-                    return
-
-        hold_start = pos.filled_at or pos.opened_at
-        if hold_start:
-            days_held = (now - datetime.fromisoformat(hold_start)).days
-            if days_held >= pos.theta_kill_days and abs(pnl_pct) < pos.theta_kill_move_pct:
-                if await _try_close(f"theta kill (day {days_held}, move={pnl_pct:+.1f}%)"):
-                    return
-            if days_held >= pos.max_hold_days:
-                if await _try_close(f"max hold ({days_held}d)"):
-                    return
 
     except Exception as e:
         log.error("[PAPER] Option quote handler error for %s: %s",

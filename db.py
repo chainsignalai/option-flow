@@ -153,6 +153,7 @@ def log_paper_event(position_id: str, ticker: str, event_type: str, **kwargs):
             "trail_active": kwargs.get("trail_active", False),
             "close_reason": kwargs.get("close_reason"),
             "metadata": kwargs.get("metadata", {}),
+            "broker": kwargs.get("broker", "alpaca"),
         }
         row = {k: v for k, v in row.items() if v is not None}
         client.table("paper_trade_events").insert(row).execute()
@@ -161,18 +162,20 @@ def log_paper_event(position_id: str, ticker: str, event_type: str, **kwargs):
         log.error(f"[DB] Failed to log paper event for {ticker}: {e}")
 
 
-def load_paper_positions() -> list[dict] | None:
+def load_paper_positions(broker: str | None = None) -> list[dict] | None:
     """Load active paper positions from Supabase (PENDING + FILLED only).
     Returns None on transient error (caller should retry), empty list when no client or no positions."""
     client = _get_client()
     if not client:
         return []
     try:
-        resp = (client.table("paper_positions")
-                .select("*")
-                .in_("status", ["PENDING", "FILLED"])
-                .execute())
-        log.info(f"[DB] Loaded {len(resp.data)} active paper positions from Supabase")
+        q = (client.table("paper_positions")
+             .select("*")
+             .in_("status", ["PENDING", "FILLED"]))
+        if broker:
+            q = q.eq("broker", broker)
+        resp = q.execute()
+        log.info(f"[DB] Loaded {len(resp.data)} active paper positions from Supabase (broker={broker})")
         return resp.data
     except Exception as e:
         log.error(f"[DB] Failed to load paper positions: {e}")
@@ -194,34 +197,38 @@ def save_paper_positions(positions: list[dict]):
         log.error(f"[DB] Failed to save paper positions: {e}")
 
 
-def load_closed_paper_positions() -> list[dict]:
+def load_closed_paper_positions(broker: str | None = None) -> list[dict]:
     """Load closed paper positions from Supabase (for portfolio summary)."""
     client = _get_client()
     if not client:
         return []
     try:
-        resp = (client.table("paper_positions")
-                .select("pnl_pct")
-                .eq("status", "CLOSED")
-                .execute())
+        q = (client.table("paper_positions")
+             .select("order_id,pnl_pct")
+             .eq("status", "CLOSED"))
+        if broker:
+            q = q.eq("broker", broker)
+        resp = q.execute()
         return [r for r in resp.data if r.get("pnl_pct") is not None]
     except Exception as e:
         log.error(f"[DB] Failed to load closed paper positions: {e}")
         return []
 
 
-def load_closed_paper_positions_since(since_iso: str) -> list[dict]:
+def load_closed_paper_positions_since(since_iso: str, broker: str | None = None) -> list[dict]:
     """Load closed paper positions since a given ISO timestamp."""
     client = _get_client()
     if not client:
         return []
     try:
-        resp = (client.table("paper_positions")
-                .select("ticker,option_type,strike,expiry,filled_price,quantity,pnl_pct,close_reason,closed_at,strategy_type")
-                .eq("status", "CLOSED")
-                .gte("closed_at", since_iso)
-                .order("closed_at")
-                .execute())
+        q = (client.table("paper_positions")
+             .select("order_id,ticker,option_type,strike,expiry,filled_price,quantity,pnl_pct,close_reason,closed_at,strategy_type")
+             .eq("status", "CLOSED")
+             .gte("closed_at", since_iso)
+             .order("closed_at"))
+        if broker:
+            q = q.eq("broker", broker)
+        resp = q.execute()
         return resp.data
     except Exception as e:
         log.error(f"[DB] Failed to load closed positions since {since_iso}: {e}")
@@ -311,6 +318,97 @@ def has_recent_leap_signal(ticker: str, hours: int = 48) -> bool:
         return len(resp.data) > 0
     except Exception as e:
         log.error(f"[DB] Failed to check recent LEAP signal for {ticker}: {e}")
+        return False
+
+
+def save_earnings_flow(ticker: str, option_type: str, strike: float, expiry: str,
+                       dte: int, premium: float, is_sweep: bool, side: str,
+                       sentiment: str, underlying_price: float,
+                       vol_oi_ratio: float = None, earnings_date: str = None):
+    """Persist a single pre-earnings flow print for accumulation tracking."""
+    client = _get_client()
+    if not client:
+        return
+    try:
+        row = {
+            "ticker": ticker,
+            "option_type": option_type,
+            "strike": strike,
+            "expiry": expiry,
+            "dte": dte,
+            "premium": premium,
+            "is_sweep": is_sweep,
+            "side": side,
+            "sentiment": sentiment,
+            "underlying_price": underlying_price,
+            "vol_oi_ratio": vol_oi_ratio,
+            "earnings_date": earnings_date,
+        }
+        row = {k: v for k, v in row.items() if v is not None}
+        client.table("earnings_flow").insert(row).execute()
+        log.info(f"[DB] Earnings flow saved: {ticker} {option_type} ${strike} {dte}DTE ${premium:,.0f}")
+    except Exception as e:
+        log.error(f"[DB] Failed to save earnings flow for {ticker}: {e}")
+
+
+def get_earnings_accumulation(lookback_days: int = 5) -> dict:
+    """Get pre-earnings flow accumulation per ticker for the last N days.
+
+    Returns dict[ticker] -> {prints, total_premium, bull_premium, bear_premium, sweep_count}
+    """
+    client = _get_client()
+    if not client:
+        return {}
+    try:
+        from datetime import datetime, timedelta
+        cutoff = (datetime.now() - timedelta(days=lookback_days)).isoformat()
+        resp = client.table("earnings_flow").select("*").gte("created_at", cutoff).execute()
+
+        accumulation = {}
+        for row in resp.data:
+            ticker = row["ticker"]
+            if ticker not in accumulation:
+                accumulation[ticker] = {
+                    "prints": [],
+                    "total_premium": 0,
+                    "bull_premium": 0,
+                    "bear_premium": 0,
+                    "sweep_count": 0,
+                    "earnings_date": row.get("earnings_date"),
+                }
+            acc = accumulation[ticker]
+            acc["prints"].append(row)
+            acc["total_premium"] += float(row["premium"])
+            if row.get("sentiment") == "BULL":
+                acc["bull_premium"] += float(row["premium"])
+            elif row.get("sentiment") == "BEAR":
+                acc["bear_premium"] += float(row["premium"])
+            if row.get("is_sweep"):
+                acc["sweep_count"] += 1
+        return accumulation
+    except Exception as e:
+        log.error(f"[DB] Failed to get earnings accumulation: {e}")
+        return {}
+
+
+def has_recent_earnings_signal(ticker: str, hours: int = 24) -> bool:
+    """Check if an earnings signal was already fired for this ticker within the last N hours."""
+    client = _get_client()
+    if not client:
+        return False
+    try:
+        from datetime import datetime, timedelta
+        cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
+        resp = (client.table("signals")
+                .select("id")
+                .eq("ticker", ticker)
+                .eq("mode", "earnings")
+                .gte("created_at", cutoff)
+                .limit(1)
+                .execute())
+        return len(resp.data) > 0
+    except Exception as e:
+        log.error(f"[DB] Failed to check recent earnings signal for {ticker}: {e}")
         return False
 
 
