@@ -412,6 +412,18 @@ def has_recent_earnings_signal(ticker: str, hours: int = 24) -> bool:
         return False
 
 
+def save_position_snapshots(snapshots: list[dict]):
+    """Persist 3:50 PM position snapshots for overnight hold analysis."""
+    client = _get_client()
+    if not client or not snapshots:
+        return
+    try:
+        client.table("position_snapshots").insert(snapshots).execute()
+        log.info(f"[DB] Saved {len(snapshots)} position snapshots")
+    except Exception as e:
+        log.error(f"[DB] Failed to save position snapshots: {e}")
+
+
 def _serialize_result(result) -> dict:
     """Convert StrategyResult to a JSON-safe dict."""
     try:

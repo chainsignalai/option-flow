@@ -15,15 +15,9 @@ import db as persistence
 
 load_dotenv()
 
-BROKER = os.getenv("BROKER", "alpaca").lower()
-
-
 def _get_broker_module():
-    if BROKER == "ib":
-        import ib_trader
-        return ib_trader
-    import paper_trader
-    return paper_trader
+    import ib_trader
+    return ib_trader
 
 
 # ---------------------------------------------------------------------------
@@ -1117,18 +1111,8 @@ def analyze_technicals(ticker: str, current_price: float = None, date: str = Non
     else:
         log.warning(f"[TECH] {ticker}: ⚠️ Bollinger Bands data unavailable")
 
-    # VWAP — institutional fair value. Price above VWAP = buyers in control.
-    log.info(f"[TECH] {ticker}: Requesting VWAP...")
-    vwap_data = uw_get(f"/api/stock/{ticker}/technical-indicator/VWAP", {
-        "interval": "daily",
-    })
-    vwap_points = vwap_data.get("data", [])
-    if vwap_points:
-        vwap_pt = _find_point_by_date(vwap_points, date, strict_before=bool(date))
-        ts.vwap = _float(vwap_pt.get("values", {}).get("VWAP"))
-        log.info(f"[TECH] {ticker}: VWAP = ${ts.vwap:.2f}")
-    else:
-        log.warning(f"[TECH] {ticker}: ⚠️ VWAP data unavailable")
+    # VWAP — UW endpoint confirmed broken (ticket filed 2026-05-05), skip to save API calls
+    log.debug(f"[TECH] {ticker}: VWAP skipped (UW endpoint broken)")
 
     # Relative Volume — UW API doesn't expose a stock volume endpoint;
     # RVOL will be populated from live WebSocket data when available.
@@ -1845,7 +1829,7 @@ def compute_trade_plan(result: StrategyResult, regime: str = None) -> TradePlan:
     # --- Suggested Contract ---
     # Filter: correct option type, OTM only, DTE within guidance range, strike within range
     # Among passing prints, pick closest to ATM (higher delta, more realistic TP)
-    max_otm = min(max(tp.target_pct * 2, 8.0) / 100, 0.15)
+    max_otm = min(max(tp.target_pct * 2, 8.0) / 100, 0.08)
     want_type = "CALL" if is_bull else "PUT"
     passing_prints = []
     top_premium_flow = None
@@ -1869,7 +1853,7 @@ def compute_trade_plan(result: StrategyResult, regime: str = None) -> TradePlan:
         if otm_pct > max_otm:
             continue
         est_delta = 0.50 if otm_pct <= 0.02 else 0.35 if otm_pct <= 0.05 else 0.25 if otm_pct <= 0.10 else 0.15
-        if est_delta < 0.20:
+        if est_delta < 0.30:
             continue
         passing_prints.append(d)
         if top_premium_flow is None or d.get('premium', 0) > top_premium_flow.get('premium', 0):
@@ -2371,12 +2355,11 @@ def scan_flow_for_candidates(min_premium: int = 100_000, limit: int = 50, date: 
         "min_premium": min_premium,
         "limit": limit,
     }
+    params["size_greater_oi"] = True
     if date:
         params["newer_than"] = f"{date}T00:00:00"
         params["older_than"] = f"{date}T23:59:59"
         params["limit"] = max(limit, 200)
-    else:
-        params["size_greater_oi"] = True
     data = uw_get("/api/option-trades/flow-alerts", params)
     if not data:
         log.warning(f"[SCAN] API returned empty response for {date or 'today'} — possible rate limit")
@@ -3121,6 +3104,80 @@ class LiveMonitor:
         except Exception:
             return False
 
+    def _intraday_conflicts(self, is_bull: bool) -> bool:
+        """Combine live ES return + market tide + GEX into a market pulse gate.
+
+        Each signal votes -1 (bearish), 0 (neutral), or +1 (bullish).
+        If 2+ signals conflict with the trade direction, block it.
+        Logs every component so we can tune thresholds from the data.
+        """
+        votes = []
+        reasons = []
+
+        # 1) ES futures intraday return (tick-by-tick)
+        es_ret = None
+        try:
+            broker = _get_broker_module()
+            if hasattr(broker, '_get_es_overnight_pct'):
+                es_ret = broker._get_es_overnight_pct()
+        except Exception:
+            pass
+        if es_ret is not None:
+            if es_ret < -0.5:
+                votes.append(-1)
+                reasons.append(f"ES {es_ret:+.2f}% [BEAR]")
+            elif es_ret > 0.5:
+                votes.append(1)
+                reasons.append(f"ES {es_ret:+.2f}% [BULL]")
+            else:
+                votes.append(0)
+                reasons.append(f"ES {es_ret:+.2f}% [FLAT]")
+
+        # 2) Market tide — net call vs put premium (live UW websocket)
+        tide = self._market_tide
+        if tide:
+            call_p = tide.get("net_call_premium", 0)
+            put_p = tide.get("net_put_premium", 0)
+            total = abs(call_p) + abs(put_p)
+            if total > 0:
+                strength = (call_p - put_p) / total
+                if strength < -0.3:
+                    votes.append(-1)
+                    reasons.append(f"Tide {strength:+.2f} [BEAR]")
+                elif strength > 0.3:
+                    votes.append(1)
+                    reasons.append(f"Tide {strength:+.2f} [BULL]")
+                else:
+                    votes.append(0)
+                    reasons.append(f"Tide {strength:+.2f} [FLAT]")
+
+        # 3) SPY GEX regime (live UW websocket)
+        spy_gex = self._gex_cache.get("SPY")
+        if spy_gex and (datetime.now() - spy_gex["cached_at"]).total_seconds() < 600:
+            gamma = spy_gex["gamma_1pct"]
+            if gamma < 0:
+                votes.append(-1)
+                reasons.append(f"SPY GEX {gamma:,.0f} [NEG]")
+            else:
+                votes.append(1)
+                reasons.append(f"SPY GEX {gamma:,.0f} [POS]")
+
+        if not votes:
+            return False
+
+        score = sum(votes)
+        pulse_str = " | ".join(reasons)
+
+        if is_bull and score <= -1:
+            log.info(f"[PULSE] BLOCKED bullish entry — score={score} ({pulse_str})")
+            return True
+        if not is_bull and score >= 1:
+            log.info(f"[PULSE] BLOCKED bearish entry — score={score} ({pulse_str})")
+            return True
+
+        log.info(f"[PULSE] OK — score={score} ({'bull' if is_bull else 'bear'} entry) ({pulse_str})")
+        return False
+
     def _should_analyze(self, ticker: str, premium: float) -> bool:
         if ticker in ETF_BLACKLIST:
             return False
@@ -3169,13 +3226,19 @@ class LiveMonitor:
 
                 if self.paper_trade and result.trade_plan:
                     is_bull = result.direction == Signal.BULLISH
-                    tech_skip = (
-                        (is_bull and result.technicals.score < 50) or
-                        (not is_bull and result.technicals.score > 50)
-                    )
-                    if tech_skip:
+                    iv_pctl = result.iv.iv_percentile
+                    from zoneinfo import ZoneInfo
+                    now_et = datetime.now(ZoneInfo("America/New_York"))
+                    too_late = (now_et.hour == 15 and now_et.minute >= 30) or now_et.hour >= 16
+                    if too_late:
+                        log.info(f"[LIVE] {ticker}: After 3:30 PM ET ({now_et.strftime('%H:%M')}) — no new entries")
+                    elif iv_pctl is not None and iv_pctl > 70:
+                        log.info(f"[LIVE] {ticker}: IV percentile {iv_pctl:.0f} > 70 (expensive) — skipping paper trade")
+                    elif (is_bull and result.technicals.score < 50) or (not is_bull and result.technicals.score > 50):
                         reason = "< 50 (weak for bullish)" if is_bull else "> 50 (unconfirmed bearish)"
                         log.info(f"[LIVE] {ticker}: Technicals score {result.technicals.score:.0f} {reason} — skipping paper trade")
+                    elif self._intraday_conflicts(is_bull):
+                        log.info(f"[LIVE] {ticker}: Intraday SPY conflicts with {'BULL' if is_bull else 'BEAR'} direction — skipping paper trade")
                     else:
                         try:
                             broker = _get_broker_module()
@@ -3598,10 +3661,6 @@ class LiveMonitor:
                 self._regime_cache = (today, get_current_regime())
             regime = self._regime_cache[1]
 
-            if regime == "NEUTRAL":
-                log.info(f"[LEAP] {ticker}: NEUTRAL regime — skipping LEAP (no API calls)")
-                return
-
             bull_prem = sum(float(p.get("premium", 0)) for p in leap_prints
                            if p.get("sentiment") == "BULL")
             bear_prem = sum(float(p.get("premium", 0)) for p in leap_prints
@@ -3613,9 +3672,27 @@ class LiveMonitor:
 
             result = analyze_ticker(ticker, regime=regime)
 
-            result.direction = leap_direction
+            if result.direction != leap_direction:
+                result.direction = leap_direction
+                directional_layers = [
+                    result.flow.signal, result.gex.signal,
+                    result.technicals.signal, result.social.signal,
+                ]
+                result.layers_aligned = sum(
+                    1 for s in directional_layers if s == leap_direction)
+                if result.composite_score >= 75 and result.layers_aligned >= 4:
+                    result.conviction = "VERY_HIGH"
+                elif result.composite_score >= 60 and result.layers_aligned >= 3:
+                    result.conviction = "HIGH"
+                elif result.composite_score >= 45 and result.layers_aligned >= 2:
+                    result.conviction = "MEDIUM"
+                elif result.composite_score >= 30:
+                    result.conviction = "LOW"
+                else:
+                    result.conviction = "NONE"
             log.info(f"[LEAP] {ticker}: Direction set to {leap_direction.value} "
-                     f"(from LEAP flow: bull=${bull_prem:,.0f} bear=${bear_prem:,.0f})")
+                     f"(from LEAP flow: bull=${bull_prem:,.0f} bear=${bear_prem:,.0f}, "
+                     f"aligned={result.layers_aligned}/4, conviction={result.conviction})")
 
             trade_plan = compute_leap_trade_plan(result, leap_prints)
             if not trade_plan:
@@ -3626,14 +3703,18 @@ class LiveMonitor:
                                     flow_contradicts=_flow_contradicts(result))
 
             if self.paper_trade:
+                if result.conviction in ("NONE", "LOW"):
+                    log.info(f"[LEAP] {ticker}: Conviction {result.conviction} too low for LEAP — skipping paper trade")
+                    return
                 is_bull = result.direction == Signal.BULLISH
-                tech_skip = (
-                    (is_bull and result.technicals.score < 50) or
-                    (not is_bull and result.technicals.score > 50)
-                )
-                if tech_skip:
+                iv_pctl = result.iv.iv_percentile
+                if iv_pctl is not None and iv_pctl > 70:
+                    log.info(f"[LEAP] {ticker}: IV percentile {iv_pctl:.0f} > 70 (expensive) — skipping paper trade")
+                elif (is_bull and result.technicals.score < 50) or (not is_bull and result.technicals.score > 50):
                     reason = "< 50 (weak for bullish)" if is_bull else "> 50 (unconfirmed bearish)"
                     log.info(f"[LEAP] {ticker}: Technicals score {result.technicals.score:.0f} {reason} — skipping paper trade")
+                elif self._intraday_conflicts(is_bull):
+                    log.info(f"[LEAP] {ticker}: Pulse gate blocked {'BULL' if is_bull else 'BEAR'} LEAP entry")
                 else:
                     try:
                         broker = _get_broker_module()
@@ -3833,10 +3914,6 @@ class LiveMonitor:
                 self._regime_cache = (today, get_current_regime())
             regime = self._regime_cache[1]
 
-            if regime == "NEUTRAL":
-                log.info(f"[EARN] {ticker}: NEUTRAL regime — skipping (no API calls)")
-                return
-
             bull_prem = sum(float(p.get("premium", 0)) for p in earnings_prints
                            if p.get("sentiment") == "BULL")
             bear_prem = sum(float(p.get("premium", 0)) for p in earnings_prints
@@ -3847,9 +3924,27 @@ class LiveMonitor:
             earn_direction = Signal.BULLISH if bull_prem > bear_prem else Signal.BEARISH
 
             result = analyze_ticker(ticker, regime=regime)
-            result.direction = earn_direction
+            if result.direction != earn_direction:
+                result.direction = earn_direction
+                directional_layers = [
+                    result.flow.signal, result.gex.signal,
+                    result.technicals.signal, result.social.signal,
+                ]
+                result.layers_aligned = sum(
+                    1 for s in directional_layers if s == earn_direction)
+                if result.composite_score >= 75 and result.layers_aligned >= 4:
+                    result.conviction = "VERY_HIGH"
+                elif result.composite_score >= 60 and result.layers_aligned >= 3:
+                    result.conviction = "HIGH"
+                elif result.composite_score >= 45 and result.layers_aligned >= 2:
+                    result.conviction = "MEDIUM"
+                elif result.composite_score >= 30:
+                    result.conviction = "LOW"
+                else:
+                    result.conviction = "NONE"
             log.info(f"[EARN] {ticker}: Direction set to {earn_direction.value} "
-                     f"(from earnings flow: bull=${bull_prem:,.0f} bear=${bear_prem:,.0f})")
+                     f"(from earnings flow: bull=${bull_prem:,.0f} bear=${bear_prem:,.0f}, "
+                     f"aligned={result.layers_aligned}/4, conviction={result.conviction})")
 
             if not earnings_date:
                 earnings_date = self._earnings_watchlist.get(ticker)
@@ -3873,13 +3968,33 @@ class LiveMonitor:
 
     async def _paper_position_loop(self):
         broker = _get_broker_module()
-        interval = 30 if BROKER == "ib" else 15
+        interval = 30
         while self._running:
             try:
                 await asyncio.sleep(interval)
                 await asyncio.to_thread(broker.check_and_manage_positions)
             except Exception as e:
                 log.error(f"[LIVE] Paper position check error: {e}")
+
+    async def _eod_snapshot_loop(self):
+        broker = _get_broker_module()
+        if not hasattr(broker, 'take_eod_snapshot'):
+            return
+        from zoneinfo import ZoneInfo
+        et = ZoneInfo("America/New_York")
+        while self._running:
+            try:
+                now_et = datetime.now(et)
+                target = now_et.replace(hour=15, minute=50, second=0, microsecond=0)
+                if now_et >= target:
+                    target += timedelta(days=1)
+                wait_secs = (target - now_et).total_seconds()
+                log.info(f"[LIVE] EOD snapshot scheduled in {wait_secs/3600:.1f}h ({target.strftime('%H:%M ET')})")
+                await asyncio.sleep(wait_secs)
+                await asyncio.to_thread(broker.take_eod_snapshot)
+            except Exception as e:
+                log.error(f"[LIVE] EOD snapshot error: {e}")
+                await asyncio.sleep(60)
 
     async def _eod_report_loop(self):
         broker = _get_broker_module()
@@ -3904,7 +4019,7 @@ class LiveMonitor:
         backoff = 5
         while self._running:
             try:
-                log.info(f"[LIVE] 🔴 Starting {BROKER.upper()} real-time trade stream")
+                log.info(f"[LIVE] 🔴 Starting {'IB'} real-time trade stream")
                 await broker.start_trade_stream()
                 backoff = 5
             except Exception as e:
@@ -3917,7 +4032,7 @@ class LiveMonitor:
         backoff = 5
         while self._running:
             try:
-                log.info(f"[LIVE] 📊 Starting {BROKER.upper()} real-time option quote stream")
+                log.info(f"[LIVE] 📊 Starting {'IB'} real-time option quote stream")
                 await broker.start_option_stream()
                 backoff = 5
             except ValueError as e:
@@ -3950,7 +4065,7 @@ class LiveMonitor:
         log.info(f"[LIVE] 🟢 ChainSignal LIVE MONITOR starting")
         log.info(f"[LIVE] Filters: min_premium=${self.min_premium:,} | min_conviction={self.min_conviction} | cooldown={self.cooldown_minutes}min")
         log.info(f"[LIVE] Telegram: {'ON' if self.send_telegram else 'OFF'}")
-        log.info(f"[LIVE] Paper trading: {'ON (' + BROKER.upper() + ')' if self.paper_trade else 'OFF'}")
+        log.info(f"[LIVE] Paper trading: {'ON (' + 'IB' + ')' if self.paper_trade else 'OFF'}")
         log.info(f"[LIVE] ETF filter: {len(ETF_BLACKLIST)} tickers excluded")
         log.info(f"[LIVE] {'='*50}")
 
@@ -3979,6 +4094,7 @@ class LiveMonitor:
             asyncio.ensure_future(self._trade_stream_loop())
             asyncio.ensure_future(self._option_stream_loop())
             asyncio.ensure_future(self._eod_report_loop())
+            asyncio.ensure_future(self._eod_snapshot_loop())
 
         asyncio.ensure_future(self._leap_scan_loop())
         log.info("[LIVE] 🔭 LEAP scan loop started (checks every 30min)")
@@ -4075,8 +4191,6 @@ def main():
                         help="Minimum conviction to trigger Telegram alert (default: MEDIUM)")
     parser.add_argument("--paper", action="store_true",
                         help="Enable paper trading in live mode")
-    parser.add_argument("--broker", type=str, choices=["alpaca", "ib"],
-                        default=None, help="Broker for paper trading (default: BROKER env var)")
     parser.add_argument("--backtest", action="store_true",
                         help="Run historical backtest over date range")
     parser.add_argument("--start-date", type=str, help="Backtest start date (YYYY-MM-DD)")
@@ -4089,10 +4203,6 @@ def main():
                         choices=["NONE", "LOW", "MEDIUM", "HIGH", "VERY_HIGH"],
                         help="Min conviction to record a trade in backtest (default: LOW)")
     args = parser.parse_args()
-
-    if args.broker:
-        global BROKER
-        BROKER = args.broker.lower()
 
     if args.telegram and (not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID):
         print("ERROR: Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env")
