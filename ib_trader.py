@@ -297,6 +297,10 @@ _closing_since: dict[str, float] = {}  # occ_symbol -> time.time() when CLOSING 
 _notified_closes: set[str] = set()  # order_ids already notified via Telegram
 _reentry_cooldowns: dict[str, float] = {}  # ticker -> time.time() of last close
 REENTRY_COOLDOWN_SECS = 3600  # 60 min before re-entering same ticker
+_ticker_daily_trades: dict[str, list[float]] = {}  # ticker -> [timestamps of entries today]
+MAX_DAILY_TRADES_PER_TICKER = 2
+_ticker_consecutive_losses: dict[str, int] = {}  # ticker -> consecutive loss count
+CONSECUTIVE_LOSS_LIMIT = 2  # block re-entry after 2 consecutive losses on same ticker
 _portfolio_prices: dict[str, tuple[float, float]] = {}  # occ_symbol -> (marketPrice, time.time())
 _unmanaged_counts: dict[str, int] = {}  # occ_symbol -> consecutive unmanaged poll cycles
 
@@ -780,10 +784,13 @@ def _submit_ib_sell(pos: PaperPosition, trigger_price: float = 0) -> Optional[fl
         limit_price = round(max(ref_price * 0.98, 0.01), 2)
         if trigger_price > 0:
             trigger_floor = round(trigger_price * 0.92, 2)
-            if trigger_floor > limit_price:
+            if trigger_floor > limit_price and trigger_floor <= ref_price:
                 log.info("[IB] %s: Raising sell limit $%.2f → $%.2f (trigger floor from $%.2f)",
                          pos.ticker, limit_price, trigger_floor, trigger_price)
                 limit_price = trigger_floor
+            elif trigger_floor > ref_price:
+                log.warning("[IB] %s: Market $%.2f gapped below trigger floor $%.2f — selling at market",
+                            pos.ticker, ref_price, trigger_floor)
 
         for exchange in _SELL_EXCHANGES:
             def _sell(exch=exchange):
@@ -876,6 +883,10 @@ def _mark_closed(pos: PaperPosition, exit_price: float, reason: str):
         pos.pnl_pct = round((exit_price - pos.filled_price) / pos.filled_price * 100, 2)
     if pos.strategy_type == "SWING":
         _reentry_cooldowns[pos.ticker] = time.time()
+        if pos.pnl_pct is not None and pos.pnl_pct < 0:
+            _ticker_consecutive_losses[pos.ticker] = _ticker_consecutive_losses.get(pos.ticker, 0) + 1
+        else:
+            _ticker_consecutive_losses.pop(pos.ticker, None)
 
 
 def _notify_close(pos: PaperPosition):
@@ -952,6 +963,20 @@ def place_paper_trade(result) -> Optional[PaperPosition]:
     if last_close and (time.time() - last_close) < REENTRY_COOLDOWN_SECS:
         mins_left = int((REENTRY_COOLDOWN_SECS - (time.time() - last_close)) / 60)
         log.info("[IB] %s: Re-entry cooldown active (%d min left) — skipping", result.ticker, mins_left)
+        return None
+
+    consec_losses = _ticker_consecutive_losses.get(result.ticker, 0)
+    if consec_losses >= CONSECUTIVE_LOSS_LIMIT:
+        log.info("[IB] %s: %d consecutive losses — blocked until a win resets", result.ticker, consec_losses)
+        return None
+
+    now_ts = time.time()
+    today_start = now_ts - (now_ts % 86400)
+    daily_entries = _ticker_daily_trades.get(result.ticker, [])
+    daily_entries = [t for t in daily_entries if t >= today_start]
+    if len(daily_entries) >= MAX_DAILY_TRADES_PER_TICKER:
+        log.info("[IB] %s: Hit daily cap (%d/%d trades today) — skipping",
+                 result.ticker, len(daily_entries), MAX_DAILY_TRADES_PER_TICKER)
         return None
 
     ib_tickers = _get_ib_tickers(ib)
@@ -1053,6 +1078,7 @@ def place_paper_trade(result) -> Optional[PaperPosition]:
         order_id = _ib_run(_place_buy, timeout=15)
         pos.order_id = f"IB-{order_id}"
         pos.status = "PENDING"
+        _ticker_daily_trades.setdefault(result.ticker, []).append(time.time())
         log.info(
             "[IB] %s: Order placed — %s $%.0f exp %s @ $%.2f limit | %s | order_id=%s",
             result.ticker, option_type, strike, expiry[:10], limit_price,
