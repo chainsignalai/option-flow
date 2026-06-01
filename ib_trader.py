@@ -378,6 +378,10 @@ def _reconcile_with_ib():
                 continue
             if ib_id not in ib_order_ids:
                 residual = _check_ib_residual(pos)
+                if residual < 0:
+                    log.warning("[IB] Reconcile: %s (order %s) — cannot verify IB state, leaving PENDING",
+                                pos.ticker, pos.order_id)
+                    continue
                 if residual > 0:
                     pos.status = "FILLED"
                     pos.quantity = residual
@@ -1325,6 +1329,10 @@ def _check_pending_order(pos: PaperPosition, now: datetime):
 
                 elif status in ("cancelled", "canceled", "inactive"):
                     residual = _check_ib_residual(pos)
+                    if residual < 0:
+                        log.warning("[IB] %s: Order %s but cannot verify residual — leaving PENDING for retry",
+                                    pos.ticker, status.upper())
+                        return
                     if residual > 0:
                         avg_cost = None
                         try:
@@ -1391,6 +1399,10 @@ def _check_pending_order(pos: PaperPosition, now: datetime):
                             _ib_run(lambda t=trade: ib.cancelOrder(t.order), timeout=15)
                             time.sleep(1)
                             residual = _check_ib_residual(pos)
+                            if residual < 0:
+                                log.warning("[IB] %s: Stale cancel — cannot verify residual, leaving PENDING",
+                                            pos.ticker)
+                                return
                             if residual > 0:
                                 avg_cost = None
                                 try:
@@ -2347,6 +2359,10 @@ def _process_order_status(order_id_str: str, status: str, avg_price: float):
     if check_cancel:
         pos, cancel_status, now = check_cancel
         residual = _check_ib_residual(pos)
+        if residual < 0:
+            log.warning("[IB] %s: Order %s but could not verify residual — leaving PENDING for poll retry",
+                        pos.ticker, cancel_status.upper())
+            return
         if residual > 0:
             ib = _get_ib()
             avg_cost = None
