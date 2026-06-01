@@ -292,7 +292,7 @@ _positions: list[PaperPosition] = []
 _positions_loaded: bool = False
 _sell_cooldowns: dict[str, float] = {}  # occ_symbol -> timestamp of last sell attempt
 _sell_fail_counts: dict[str, int] = {}  # occ_symbol -> consecutive sell failure count
-_sell_fail_alerted: dict[str, float] = {}  # occ_symbol -> time.time() when alerted (retries after 30 min)
+_sell_fail_alerted: dict[str, float] = {}  # occ_symbol -> time.time() when alerted (rate-limits alerts to 1 per 30 min)
 _closing_since: dict[str, float] = {}  # occ_symbol -> time.time() when CLOSING started
 _notified_closes: set[str] = set()  # order_ids already notified via Telegram
 _reentry_cooldowns: dict[str, float] = {}  # ticker -> time.time() of last close
@@ -544,7 +544,8 @@ def _find_portfolio_contract(ib, occ_symbol: str):
     """Look up an already-qualified contract from IB's portfolio by OCC symbol.
 
     Fallback when _qualify fails — IB already holds the position so the
-    contract is guaranteed valid. Returns (contract, qty) or (None, 0).
+    contract is guaranteed valid. Returns (contract, qty), (None, 0) if not found,
+    or (None, -1) on error.
     """
     parsed = _occ_to_ib_contract(occ_symbol)
     try:
@@ -561,7 +562,7 @@ def _find_portfolio_contract(ib, occ_symbol: str):
         return _ib_run(_lookup, timeout=15)
     except Exception as e:
         log.error("[IB] Portfolio contract lookup failed for %s: %s", occ_symbol, e)
-        return None, 0
+        return None, -1
 
 
 def _get_ib_tickers(ib) -> Optional[set[str]]:
@@ -571,11 +572,11 @@ def _get_ib_tickers(ib) -> Optional[set[str]]:
         tickers = set()
         for pos in ib.positions():
             c = pos.contract
-            if hasattr(c, 'symbol'):
+            if hasattr(c, 'right') and hasattr(c, 'symbol'):
                 tickers.add(c.symbol)
         for trade in ib.openTrades():
             c = trade.contract
-            if hasattr(c, 'symbol'):
+            if hasattr(c, 'right') and hasattr(c, 'symbol'):
                 tickers.add(c.symbol)
         return tickers
     try:
@@ -701,6 +702,8 @@ def _check_ib_residual(pos: PaperPosition) -> int:
         portfolio_contract, qty = _find_portfolio_contract(ib, pos.occ_symbol)
         if portfolio_contract:
             return qty
+        if qty == -1:
+            return -1
         contract = _occ_to_ib_contract(pos.occ_symbol)
         if not _qualify(ib, contract):
             return 0
@@ -739,9 +742,6 @@ def _submit_ib_sell(pos: PaperPosition, trigger_price: float = 0) -> Optional[fl
         if time.time() - last_attempt < 30:
             return None
         _sell_cooldowns[cooldown_key] = time.time()
-        alerted_at = _sell_fail_alerted.get(cooldown_key)
-        if alerted_at and time.time() - alerted_at < 1800:
-            return None
 
     ib = _get_ib()
     if not ib:
@@ -910,7 +910,7 @@ def _notify_close(pos: PaperPosition):
     if pos.peak_premium and pos.filled_price:
         peak_pnl = (pos.peak_premium - pos.filled_price) / pos.filled_price * 100
         peak_dollar = (pos.peak_premium - pos.filled_price) * (pos.quantity or 1) * 100
-        peak_str = f"\nPeak: ${pos.peak_premium:.2f} (+{peak_pnl:.1f}% / +${peak_dollar:,.0f})"
+        peak_str = f"\nPeak: ${pos.peak_premium:.2f} ({peak_pnl:+.1f}% / ${peak_dollar:+,.0f})"
     es_line = ""
     if pos.es_overnight_pct is not None:
         es_line = f"\nES: {pos.es_overnight_pct:+.2f}%"
@@ -988,7 +988,7 @@ def place_paper_trade(result) -> Optional[PaperPosition]:
 
     occ_symbol = _build_occ_symbol(result.ticker, expiry, option_type, strike)
 
-    mid_price = _get_option_mid_price(occ_symbol, require_two_sided=False)
+    mid_price = _get_option_mid_price(occ_symbol)
     if mid_price and mid_price > 0:
         limit_price = mid_price
     else:
@@ -1000,8 +1000,8 @@ def place_paper_trade(result) -> Optional[PaperPosition]:
     if MAX_POSITION_COST > 0:
         cost_per = limit_price * 100
         quantity = max(1, int(MAX_POSITION_COST / cost_per))
-        if cost_per > MAX_POSITION_COST:
-            log.warning("[IB] %s: Single contract $%.0f exceeds position cap $%.0f — SKIPPING",
+        if cost_per > MAX_POSITION_COST * 1.10:
+            log.warning("[IB] %s: Single contract $%.0f exceeds position cap $%.0f (+10%%) — SKIPPING",
                         result.ticker, cost_per, MAX_POSITION_COST)
             return None
 
@@ -2101,6 +2101,13 @@ def _on_pending_tickers(tickers):
                             f"\U0001f534 <b>ES GAP ALERT</b> {pct:+.2f}%\n"
                             f"ES prev close: {_es_prev_close:.2f} → Current: {_es_current:.2f}\n"
                             f"All bullish swing positions flagged"
+                        )
+                    elif pct > -0.5 and _es_flagged_for_close:
+                        _es_flagged_for_close = False
+                        log.info("[IB-ES] ES recovered above -0.5%%: %.2f%% — gap flag cleared", pct)
+                        _send_paper_telegram(
+                            f"\U0001f7e2 <b>ES GAP CLEARED</b> {pct:+.2f}%\n"
+                            f"ES recovered — bullish entries no longer auto-closed"
                         )
 
     with _tick_lock:

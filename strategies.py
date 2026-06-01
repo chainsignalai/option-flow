@@ -3168,10 +3168,10 @@ class LiveMonitor:
         score = sum(votes)
         pulse_str = " | ".join(reasons)
 
-        if is_bull and score <= -1:
+        if is_bull and score <= -2:
             log.info(f"[PULSE] BLOCKED bullish entry — score={score} ({pulse_str})")
             return True
-        if not is_bull and score >= 1:
+        if not is_bull and score >= 2:
             log.info(f"[PULSE] BLOCKED bearish entry — score={score} ({pulse_str})")
             return True
 
