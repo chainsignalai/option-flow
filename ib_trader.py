@@ -299,10 +299,6 @@ _reentry_cooldowns: dict[str, float] = {}  # ticker -> time.time() of last close
 REENTRY_COOLDOWN_SECS = 3600  # 60 min before re-entering same ticker
 _ticker_daily_trades: dict[str, list[float]] = {}  # ticker -> [timestamps of entries today]
 MAX_DAILY_TRADES_PER_TICKER = 2
-_ticker_consecutive_losses: dict[str, int] = {}  # ticker -> consecutive loss count
-_ticker_loss_blocked_until: dict[str, float] = {}  # ticker -> time.time() when block expires
-CONSECUTIVE_LOSS_LIMIT = 2  # block re-entry after 2 consecutive losses on same ticker
-LOSS_BLOCK_SECS = 86400  # 24h block after consecutive losses
 _portfolio_prices: dict[str, tuple[float, float]] = {}  # occ_symbol -> (marketPrice, time.time())
 _unmanaged_counts: dict[str, int] = {}  # occ_symbol -> consecutive unmanaged poll cycles
 
@@ -885,15 +881,6 @@ def _mark_closed(pos: PaperPosition, exit_price: float, reason: str):
         pos.pnl_pct = round((exit_price - pos.filled_price) / pos.filled_price * 100, 2)
     if pos.strategy_type == "SWING":
         _reentry_cooldowns[pos.ticker] = time.time()
-        if pos.pnl_pct is not None and pos.pnl_pct < 0:
-            count = _ticker_consecutive_losses.get(pos.ticker, 0) + 1
-            _ticker_consecutive_losses[pos.ticker] = count
-            if count >= CONSECUTIVE_LOSS_LIMIT:
-                _ticker_loss_blocked_until[pos.ticker] = time.time() + LOSS_BLOCK_SECS
-                log.info("[IB] %s: %d consecutive losses — blocked for 24h", pos.ticker, count)
-        else:
-            _ticker_consecutive_losses.pop(pos.ticker, None)
-            _ticker_loss_blocked_until.pop(pos.ticker, None)
 
 
 def _notify_close(pos: PaperPosition):
@@ -970,12 +957,6 @@ def place_paper_trade(result) -> Optional[PaperPosition]:
     if last_close and (time.time() - last_close) < REENTRY_COOLDOWN_SECS:
         mins_left = int((REENTRY_COOLDOWN_SECS - (time.time() - last_close)) / 60)
         log.info("[IB] %s: Re-entry cooldown active (%d min left) — skipping", result.ticker, mins_left)
-        return None
-
-    blocked_until = _ticker_loss_blocked_until.get(result.ticker)
-    if blocked_until and time.time() < blocked_until:
-        hours_left = (blocked_until - time.time()) / 3600
-        log.info("[IB] %s: Loss streak block active (%.1fh left) — skipping", result.ticker, hours_left)
         return None
 
     now_ts = time.time()
