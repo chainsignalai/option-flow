@@ -209,16 +209,32 @@ _ib_stream = None         # clientId+1 for streaming (async)
 _ib_lock = threading.Lock()
 
 
+_ib_disconnect_alerted = False
+
+
 def _get_ib():
     """Lazy connection to TWS for order placement and position queries."""
-    global _ib_order
+    global _ib_order, _ib_disconnect_alerted
     with _ib_lock:
         if _ib_order is not None:
             try:
                 if _ib_order.isConnected():
+                    if _ib_disconnect_alerted:
+                        _ib_disconnect_alerted = False
+                        _send_paper_telegram(
+                            "\U0001f7e2 <b>IB ORDER CONNECTION RESTORED</b>\n"
+                            "Order placement and position checks are back online."
+                        )
                     return _ib_order
             except Exception:
                 pass
+            if not _ib_disconnect_alerted:
+                _ib_disconnect_alerted = True
+                _send_paper_telegram(
+                    "\U0001f534 <b>IB ORDER CONNECTION LOST</b>\n"
+                    "Cannot place orders or check positions.\n"
+                    "Attempting to reconnect..."
+                )
             _ib_order = None
         try:
             def _connect():
@@ -2249,6 +2265,10 @@ async def start_option_stream():
         _stream_ib = ib
         _stream_loop = asyncio.get_event_loop()
         log.info("[IB-STREAM] \U0001f4ca Streaming connection established (clientId=%d)", IB_CLIENT_ID + 1)
+        _send_paper_telegram(
+            "\U0001f7e2 <b>IB STREAM CONNECTED</b>\n"
+            "Real-time exit monitoring is active."
+        )
     except Exception as e:
         log.error("[IB-STREAM] Failed to connect: %s", e)
         raise
@@ -2272,6 +2292,12 @@ async def start_option_stream():
         if not ib.isConnected():
             _stream_ib = None
             _stream_loop = None
+            _send_paper_telegram(
+                "\U0001f534 <b>IB STREAM DISCONNECTED</b>\n"
+                "Real-time exit monitoring is DOWN.\n"
+                "Positions are UNMANAGED until reconnect.\n"
+                "Check TWS/IB Gateway."
+            )
             raise ConnectionError("IB streaming connection lost")
 
 
