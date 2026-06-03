@@ -745,16 +745,11 @@ _SELL_EXCHANGES = ["SMART", "CBOE", "AMEX", "ISE", "NASDAQOM", "PHLX", "BOX"]
 
 
 def _submit_ib_sell(pos: PaperPosition, trigger_price: float = 0) -> Optional[float]:
-    """Submit IB limit sell (aggressive) and poll for fill. Returns fill price or None.
+    """Submit aggressive sell and poll for fill. Returns fill price or None.
 
-    Uses LimitOrder with tif='GTC' to avoid TWS preset overriding to DAY
-    and triggering Error 201 trading-permissions rejection on MarketOrders.
+    Uses LimitOrder at bid*0.90 (effectively market) with tif='GTC' to avoid
+    TWS preset overriding to DAY and triggering Error 201 on MarketOrders.
     On rejection (Error 201 / Inactive / Cancelled), retries on fallback exchanges.
-    On PendingSubmit stall, also tries the next exchange (IB may not accept
-    orders on SMART at market open).
-
-    trigger_price: the price that triggered the exit decision. Used as a floor
-    for the sell limit to prevent excessive slippage between trigger and fill.
 
     BLOCKING (up to ~30s). Must NOT be called while holding _tick_lock.
     """
@@ -795,16 +790,7 @@ def _submit_ib_sell(pos: PaperPosition, trigger_price: float = 0) -> Optional[fl
                             pos.ticker)
                 return None
         ref_price = bid or last_px
-        limit_price = round(max(ref_price * 0.98, 0.01), 2)
-        if trigger_price > 0:
-            trigger_floor = round(trigger_price * 0.92, 2)
-            if trigger_floor > limit_price and trigger_floor <= ref_price:
-                log.info("[IB] %s: Raising sell limit $%.2f → $%.2f (trigger floor from $%.2f)",
-                         pos.ticker, limit_price, trigger_floor, trigger_price)
-                limit_price = trigger_floor
-            elif trigger_floor > ref_price:
-                log.warning("[IB] %s: Market $%.2f gapped below trigger floor $%.2f — selling at market",
-                            pos.ticker, ref_price, trigger_floor)
+        limit_price = round(max(ref_price * 0.90, 0.01), 2)
 
         for exchange in _SELL_EXCHANGES:
             def _sell(exch=exchange):
