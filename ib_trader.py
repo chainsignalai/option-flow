@@ -1579,10 +1579,13 @@ def check_and_manage_positions(ticker: str = None):
                     log.warning("[IB] %s: Price unavailable — position UNMANAGED this cycle #%d (%s)",
                                 pos.ticker, cnt, pos.occ_symbol)
                     if cnt == 10:
-                        _send_paper_telegram(
-                            f"⚠️ {pos.ticker} {pos.strike}{pos.option_type[0]} "
-                            f"{pos.expiry}: UNMANAGED for {cnt} consecutive cycles — "
-                            f"no price available from snapshot or portfolio fallback")
+                        from zoneinfo import ZoneInfo
+                        et_hour = datetime.now(ZoneInfo("America/New_York")).hour
+                        if 9 <= et_hour < 16:
+                            _send_paper_telegram(
+                                f"⚠️ {pos.ticker} {pos.strike}{pos.option_type[0]} "
+                                f"{pos.expiry}: UNMANAGED for {cnt} consecutive cycles — "
+                                f"no price available from snapshot or portfolio fallback")
                     continue
                 _unmanaged_counts.pop(pos.occ_symbol, None)
                 leap_reason = leap_stops.get(pos.occ_symbol)
