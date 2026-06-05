@@ -939,10 +939,23 @@ def _notify_close(pos: PaperPosition):
 # Order placement
 # ---------------------------------------------------------------------------
 
+_entry_blocked_count: int = 0
+_entry_blocked_alerted: float = 0
+
+
 def place_paper_trade(result) -> Optional[PaperPosition]:
     """Place a paper option order via IB based on a StrategyResult."""
+    global _entry_blocked_count, _entry_blocked_alerted
     ib = _get_ib()
     if not ib:
+        _entry_blocked_count += 1
+        if _entry_blocked_count >= 3 and (time.time() - _entry_blocked_alerted) > 1800:
+            _entry_blocked_alerted = time.time()
+            _send_paper_telegram(
+                f"\U0001f6a8 <b>ENTRIES BLOCKED</b>\n"
+                f"{_entry_blocked_count} qualifying signals skipped — no IB connection.\n"
+                f"Check TWS/IB Gateway."
+            )
         log.warning("[IB] No connection — skipping")
         return None
 
@@ -1051,6 +1064,11 @@ def place_paper_trade(result) -> Optional[PaperPosition]:
         contract = _occ_to_ib_contract(occ_symbol)
         if not _qualify(ib, contract):
             log.error("[IB] %s: Could not qualify contract %s — skipping", result.ticker, occ_symbol)
+            _send_paper_telegram(
+                f"⚠️ <b>CONTRACT NOT FOUND</b>\n"
+                f"{result.ticker} {option_type} ${strike:.0f} exp {expiry[:10]}\n"
+                f"IB cannot qualify {occ_symbol}"
+            )
             pos.status = "REJECTED"
             pos.close_reason = "contract not found"
             with _tick_lock:
@@ -1069,6 +1087,7 @@ def place_paper_trade(result) -> Optional[PaperPosition]:
         order_id = _ib_run(_place_buy, timeout=15)
         pos.order_id = f"IB-{order_id}"
         pos.status = "PENDING"
+        _entry_blocked_count = 0
         _ticker_daily_trades.setdefault(result.ticker, []).append(time.time())
         log.info(
             "[IB] %s: Order placed — %s $%.0f exp %s @ $%.2f limit | %s | order_id=%s",
@@ -1102,6 +1121,11 @@ def place_paper_trade(result) -> Optional[PaperPosition]:
         )
     except Exception as e:
         log.error("[IB] %s: Order failed — %s", result.ticker, e)
+        _send_paper_telegram(
+            f"\U0001f6a8 <b>ORDER FAILED</b>\n"
+            f"{result.ticker} {option_type} ${strike:.0f} exp {expiry[:10]}\n"
+            f"Error: {str(e)[:100]}"
+        )
         pos.status = "REJECTED"
         pos.close_reason = str(e)
         log_paper_event(
