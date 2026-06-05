@@ -250,9 +250,22 @@ def _get_ib():
                 ib.updatePortfolioEvent += _on_portfolio_update
                 log.info("[IB] Order connection established (clientId=%d)", IB_CLIENT_ID)
             _ib_run(_connect, timeout=60)
+            if _ib_disconnect_alerted:
+                _ib_disconnect_alerted = False
+                _send_paper_telegram(
+                    "\U0001f7e2 <b>IB ORDER CONNECTION RESTORED</b>\n"
+                    "Order placement and position checks are back online."
+                )
             return _ib_order
         except Exception as e:
             log.error("[IB] Failed to connect to TWS at %s:%d — %s", IB_HOST, IB_PORT, e)
+            if not _ib_disconnect_alerted:
+                _ib_disconnect_alerted = True
+                _send_paper_telegram(
+                    "\U0001f534 <b>IB CONNECTION FAILED</b>\n"
+                    f"Cannot connect to TWS at {IB_HOST}:{IB_PORT}\n"
+                    "Start TWS/IB Gateway. Bot will auto-reconnect."
+                )
             return None
 
 
