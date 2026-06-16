@@ -3231,15 +3231,30 @@ class LiveMonitor:
                     from zoneinfo import ZoneInfo
                     now_et = datetime.now(ZoneInfo("America/New_York"))
                     too_late = (now_et.hour == 15 and now_et.minute >= 30) or now_et.hour >= 16
+
+                    _TICKER_BLACKLIST = {"META", "GOOGL", "NBIS", "MRVL", "CRWV"}
+
+                    skip_reason = None
                     if too_late:
-                        log.info(f"[LIVE] {ticker}: After 3:30 PM ET ({now_et.strftime('%H:%M')}) — no new entries")
+                        skip_reason = f"After 3:30 PM ET ({now_et.strftime('%H:%M')}) — no new entries"
+                    elif ticker in _TICKER_BLACKLIST:
+                        skip_reason = "Blacklisted (high never-green rate)"
                     elif iv_pctl is not None and iv_pctl > 70:
-                        log.info(f"[LIVE] {ticker}: IV percentile {iv_pctl:.0f} > 70 (expensive) — skipping paper trade")
-                    elif (is_bull and result.technicals.score < 50) or (not is_bull and result.technicals.score > 50):
-                        reason = "< 50 (weak for bullish)" if is_bull else "> 50 (unconfirmed bearish)"
-                        log.info(f"[LIVE] {ticker}: Technicals score {result.technicals.score:.0f} {reason} — skipping paper trade")
+                        skip_reason = f"IV percentile {iv_pctl:.0f} > 70 (expensive)"
+                    elif is_bull and result.technicals.score < 50:
+                        skip_reason = f"Technicals score {result.technicals.score:.0f} < 50 (weak for bullish)"
+                    elif not is_bull and result.technicals.score > 50:
+                        skip_reason = f"Technicals score {result.technicals.score:.0f} > 50 (unconfirmed bearish)"
                     elif self._intraday_conflicts(is_bull):
-                        log.info(f"[LIVE] {ticker}: Intraday SPY conflicts with {'BULL' if is_bull else 'BEAR'} direction — skipping paper trade")
+                        skip_reason = f"Intraday SPY conflicts with {'BULL' if is_bull else 'BEAR'} direction"
+                    else:
+                        from ib_trader import _get_es_overnight_pct
+                        es_pct = _get_es_overnight_pct()
+                        if es_pct is not None and es_pct < -0.3 and is_bull:
+                            skip_reason = f"ES down {es_pct:+.2f}% — skipping bullish entry"
+
+                    if skip_reason:
+                        log.info(f"[LIVE] {ticker}: {skip_reason} — skipping paper trade")
                     else:
                         try:
                             broker = _get_broker_module()
