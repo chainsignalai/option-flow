@@ -25,6 +25,7 @@ from db import (
     save_paper_positions,
     load_closed_paper_positions,
     load_closed_paper_positions_since,
+    fmt_strike,
 )
 
 
@@ -96,11 +97,12 @@ def _build_occ_symbol(ticker: str, expiry: str, option_type: str, strike: float)
 
 
 def _progressive_stop(peak_pnl_pct: float) -> Optional[float]:
-    if peak_pnl_pct < 10:
+    if peak_pnl_pct < 5:
         return None
     if peak_pnl_pct >= 100:
         return peak_pnl_pct - (peak_pnl_pct * 0.05)
     tiers = [
+        (5,  -5.0),
         (10,  0.0),
         (20,  10.0),
         (30,  30 * 0.85),
@@ -328,6 +330,12 @@ _reentry_cooldowns: dict[str, float] = {}  # ticker -> time.time() of last close
 REENTRY_COOLDOWN_SECS = 3600  # 60 min before re-entering same ticker
 _ticker_daily_trades: dict[str, list[float]] = {}  # ticker -> [timestamps of entries today]
 MAX_DAILY_TRADES_PER_TICKER = 2
+# Don't whipsaw out of a just-opened position when a noisy re-analysis flips the
+# signal seconds later. Price-based stop still applies. See check_flow_contradiction.
+CONTRADICTION_MIN_HOLD_MIN = 10
+# Cancel an unfilled ENTRY (BUY) order after this many seconds so it can't fill
+# late at a stale, off-market price (the cause of churned-entry losses).
+ENTRY_FILL_TIMEOUT_SECS = 90
 _portfolio_prices: dict[str, tuple[float, float]] = {}  # occ_symbol -> (marketPrice, time.time())
 _unmanaged_counts: dict[str, int] = {}  # occ_symbol -> consecutive unmanaged poll cycles
 
@@ -754,17 +762,59 @@ def _check_ib_residual(pos: PaperPosition) -> int:
         return -1
 
 
+def _get_recent_sell_fill(pos: PaperPosition) -> Optional[float]:
+    """Avg fill price of the most recent SELL execution for this contract.
+
+    Used when a sell fills at IB but our placement poll missed the price
+    (timeout, or a fill that landed during cancellation). Without this the
+    close is recorded at the trigger price, overstating realized P&L.
+    Returns None if no matching execution is found (e.g. fill happened in a
+    previous session before a restart — ib.fills() only holds the current one).
+    """
+    ib = _get_ib()
+    if not ib:
+        return None
+    try:
+        parsed = _occ_to_ib_contract(pos.occ_symbol)
+        def _scan():
+            best_price = None
+            best_time = None
+            for f in ib.fills():
+                ex = getattr(f, "execution", None)
+                c = getattr(f, "contract", None)
+                if not ex or not c or getattr(ex, "side", "") != "SLD":
+                    continue
+                if not (c.symbol == parsed.symbol
+                        and c.lastTradeDateOrContractMonth == parsed.lastTradeDateOrContractMonth
+                        and float(getattr(c, "strike", 0)) == float(parsed.strike)
+                        and getattr(c, "right", "") == parsed.right):
+                    continue
+                price = getattr(ex, "avgPrice", 0) or getattr(ex, "price", 0)
+                t = getattr(ex, "time", None)
+                if price and (best_time is None or (t and t >= best_time)):
+                    best_price, best_time = price, t
+            return best_price
+        return _ib_run(_scan, timeout=15)
+    except Exception as e:
+        log.warning("[IB] %s: Could not fetch actual sell fill price: %s", pos.ticker, e)
+        return None
+
+
 _SELL_EXCHANGES = ["SMART", "CBOE", "AMEX", "ISE", "NASDAQOM", "PHLX", "BOX"]
 
 
 def _submit_ib_sell(pos: PaperPosition, trigger_price: float = 0) -> Optional[float]:
-    """Submit aggressive sell and poll for fill. Returns fill price or None.
+    """Submit a sell and poll for fill. Returns fill price or None.
 
-    Uses LimitOrder at bid*0.90 (effectively market) with tif='GTC' to avoid
-    TWS preset overriding to DAY and triggering Error 201 on MarketOrders.
-    On rejection (Error 201 / Inactive / Cancelled), retries on fallback exchanges.
+    Two-step exit, both SMART-routed, tif='GTC':
+      1. Aggressive marketable LIMIT at bid*0.90 — fills at/near the bid in LIVE
+         with a price floor.
+      2. If that does not fill (notably IB paper, which does not fill marketable
+         option limits), escalate to a MARKET order, which fills reliably.
+    Each step confirms any working order is cancelled before the next, so two
+    live SELLs can never both fill (oversell protection).
 
-    BLOCKING (up to ~30s). Must NOT be called while holding _tick_lock.
+    BLOCKING (up to ~45s). Must NOT be called while holding _tick_lock.
     """
     cooldown_key = pos.occ_symbol
     with _tick_lock:
@@ -805,42 +855,103 @@ def _submit_ib_sell(pos: PaperPosition, trigger_price: float = 0) -> Optional[fl
         ref_price = bid or last_px
         limit_price = round(max(ref_price * 0.90, 0.01), 2)
 
-        for exchange in _SELL_EXCHANGES:
-            def _sell(exch=exchange):
-                contract.exchange = exch
-                order = LimitOrder('SELL', pos.quantity, limit_price)
-                order.tif = 'GTC'
-                log.info("[IB] %s: Submitting SELL %d @ limit $%.2f via %s (bid=$%s, last=$%s)",
-                         pos.ticker, pos.quantity, limit_price, exch,
-                         f"{bid:.2f}" if bid else "N/A",
-                         f"{last_px:.2f}" if last_px else "N/A")
-                trade = ib.placeOrder(contract, order)
-                for _ in range(20):
+        # Safety: cancel any SELL order already resting on this contract (e.g. a
+        # stalled order from a previous cycle) and confirm it is dead BEFORE
+        # placing a new one. Matching is by conId, so it is exchange-agnostic.
+        # Without this, a still-working order plus a fresh one could both fill
+        # and oversell the position (going short naked options).
+        def _clear_existing_sells():
+            working = [t for t in ib.openTrades()
+                       if t.order.action == 'SELL'
+                       and getattr(t.contract, 'conId', None) == contract.conId
+                       and t.orderStatus.status in
+                       ('Submitted', 'PreSubmitted', 'PendingSubmit', 'PendingCancel')]
+            for t in working:
+                ib.cancelOrder(t.order)
+            if working:
+                for _ in range(40):  # up to 20s for cancels to confirm
                     ib.sleep(0.5)
-                    if trade.orderStatus.status in ('Filled', 'Cancelled', 'Inactive'):
-                        break
-                if trade.orderStatus.status == 'Filled' and trade.orderStatus.avgFillPrice > 0:
-                    return trade.orderStatus.avgFillPrice
-                rejected = trade.orderStatus.status in ('Cancelled', 'Inactive')
-                if not rejected:
-                    try:
-                        ib.cancelOrder(trade.order)
-                        ib.sleep(1)
-                        if trade.orderStatus.status == 'Filled' and trade.orderStatus.avgFillPrice > 0:
-                            return trade.orderStatus.avgFillPrice
-                    except Exception:
-                        pass
-                return "REJECTED" if rejected else None
+                    if all(t.orderStatus.status in ('Cancelled', 'Inactive', 'Filled')
+                           for t in working):
+                        return len(working)
+                # at least one could not be confirmed dead
+                return -1
+            return 0
+        try:
+            n_pre = _ib_run(_clear_existing_sells, timeout=30)
+        except Exception as e:
+            log.error("[IB] %s: Could not check for pre-existing SELL orders — "
+                      "aborting sell for safety: %s", pos.ticker, e)
+            return None
+        if n_pre < 0:
+            log.error("[IB] %s: Pre-existing SELL order would not confirm cancel — "
+                      "aborting sell cycle to avoid duplicate live orders; will retry.",
+                      pos.ticker)
+            return None
+        if n_pre:
+            log.warning("[IB] %s: Cleared %d stale working SELL order(s) before re-submitting",
+                        pos.ticker, n_pre)
 
-            result = _ib_run(_sell, timeout=30)
-            if isinstance(result, float) and result > 0:
-                _sell_fail_counts.pop(cooldown_key, None)
-                return result
-            if result == "REJECTED":
-                log.warning("[IB] %s: Sell rejected on %s — trying next exchange", pos.ticker, exchange)
-                continue
-            log.warning("[IB] %s: Sell stalled/unfilled on %s — trying next exchange", pos.ticker, exchange)
-            continue
+        from ib_insync import MarketOrder
+
+        def _try_order(make_order, label, poll_ticks):
+            """Place a SELL on SMART and poll for fill. Returns avg fill price,
+            'REJECTED' (terminal), None (stalled but confirmed cancelled), or
+            'ABORT' (cancel could not be confirmed — do not place anything else)."""
+            contract.exchange = 'SMART'
+            order = make_order()
+            order.tif = 'GTC'
+            log.info("[IB] %s: Submitting SELL %d via SMART [%s] (bid=$%s, last=$%s)",
+                     pos.ticker, pos.quantity, label,
+                     f"{bid:.2f}" if bid else "N/A",
+                     f"{last_px:.2f}" if last_px else "N/A")
+            trade = ib.placeOrder(contract, order)
+            for _ in range(poll_ticks):
+                ib.sleep(0.5)
+                if trade.orderStatus.status in ('Filled', 'Cancelled', 'Inactive'):
+                    break
+            if trade.orderStatus.status == 'Filled' and trade.orderStatus.avgFillPrice > 0:
+                return trade.orderStatus.avgFillPrice
+            if trade.orderStatus.status in ('Cancelled', 'Inactive'):
+                return "REJECTED"
+            # Still working — cancel and CONFIRM dead before any further order,
+            # so we never have two live SELLs that could both fill (oversell).
+            ib.cancelOrder(trade.order)
+            for _ in range(40):
+                ib.sleep(0.5)
+                st = trade.orderStatus.status
+                if st == 'Filled' and trade.orderStatus.avgFillPrice > 0:
+                    return trade.orderStatus.avgFillPrice
+                if st in ('Cancelled', 'Inactive'):
+                    return None
+            log.error("[IB] %s: SELL stuck in '%s' after cancel — aborting cycle to avoid "
+                      "duplicate live orders; will retry.", pos.ticker, trade.orderStatus.status)
+            return "ABORT"
+
+        # 1) Aggressive marketable LIMIT first. In LIVE this fills at/near the bid
+        #    with a price floor (won't dump below bid*0.90). Poll ~12s.
+        result = _ib_run(lambda: _try_order(
+            lambda: LimitOrder('SELL', pos.quantity, limit_price),
+            f"LMT ${limit_price:.2f}", 24), timeout=40)
+        if isinstance(result, float) and result > 0:
+            _sell_fail_counts.pop(cooldown_key, None)
+            return result
+        if result == "ABORT":
+            return None
+
+        # 2) Escalate to a MARKET order. This reliably fills where the limit stalls
+        #    — notably IB paper (proven 2026-06-09: market sells filled instantly
+        #    while the bid*0.90 limit sat unfilled for an hour). Also the live
+        #    backstop for a fast-moving exit. Poll ~15s.
+        log.warning("[IB] %s: Limit sell did not fill (%s) — escalating to MARKET order",
+                    pos.ticker, result)
+        result = _ib_run(lambda: _try_order(
+            lambda: MarketOrder('SELL', pos.quantity), "MKT", 30), timeout=45)
+        if isinstance(result, float) and result > 0:
+            _sell_fail_counts.pop(cooldown_key, None)
+            return result
+        if result == "ABORT":
+            return None
 
         fail_count = _sell_fail_counts.get(cooldown_key, 0) + 1
         _sell_fail_counts[cooldown_key] = fail_count
@@ -850,12 +961,12 @@ def _submit_ib_sell(pos: PaperPosition, trigger_price: float = 0) -> Optional[fl
         if should_alert:
             _sell_fail_alerted[cooldown_key] = time.time()
             _send_paper_telegram(
-                f"🚨 <b>SELL FAILED {fail_count}x — MANUAL CLOSE REQUIRED</b>\n"
-                f"{pos.ticker} {pos.option_type} ${pos.strike:.0f} exp {pos.expiry}\n"
-                f"Tried all exchanges ({', '.join(_SELL_EXCHANGES)})\n"
-                f"IB rejects the sell order. Close this position manually in TWS."
+                f"🚨 <b>SELL FAILED {fail_count}x — MANUAL CLOSE MAY BE NEEDED</b>\n"
+                f"{pos.ticker} {pos.option_type} ${fmt_strike(pos.strike)} exp {pos.expiry}\n"
+                f"Neither limit nor market order filled (or could not confirm cancel).\n"
+                f"Position kept FILLED and bot keeps retrying. Close manually in TWS if it persists."
             )
-            log.error("[IB] %s: PERMANENT SELL FAILURE after %d attempts across all exchanges — alerted via Telegram",
+            log.error("[IB] %s: PERMANENT SELL FAILURE after %d attempts (limit+market) — alerted via Telegram",
                       pos.ticker, fail_count)
         return None
     except Exception as e:
@@ -940,12 +1051,67 @@ def _notify_close(pos: PaperPosition):
         es_line = f"\nES: {pos.es_overnight_pct:+.2f}%"
     _send_paper_telegram(
         f"{pnl_emoji} <b>IB PAPER TRADE CLOSED</b>\n"
-        f"{pos.ticker} {pos.option_type} ${pos.strike:.0f} exp {pos.expiry}\n"
+        f"{pos.ticker} {pos.option_type} ${fmt_strike(pos.strike)} exp {pos.expiry}\n"
         f"Entry: {entry_str} (${cost_dollar:,.0f}) → Exit: ${exit_price:.2f} (${exit_dollar:,.0f})\n"
         f"PnL: {pnl_str} / ${pnl_dollar:+,.0f}"
         f"{peak_str}{es_line}\n"
         f"Reason: {reason}"
     )
+
+
+def _close_via_sell(pos: PaperPosition, trigger_price: float, reason: str):
+    """Submit an IB sell for a CLOSING position and finalize its state.
+
+    Single source of truth for the submit -> fill/residual reconciliation used
+    by the poll loop, the streaming tick loop, and the flow-contradiction loop.
+    On a confirmed fill (or residual==0) the position is marked CLOSED at the
+    actual execution price; otherwise it is reverted to FILLED for retry so bot
+    state never diverges from IB.
+    """
+    fill_price = _submit_ib_sell(pos, trigger_price=trigger_price)
+    if fill_price:
+        _unsubscribe_ib_quotes(pos.occ_symbol)
+        if abs(fill_price - trigger_price) > 0.005:
+            log.info("[IB] %s: Fill $%.2f vs trigger $%.2f (diff=$%.2f)",
+                     pos.ticker, fill_price, trigger_price,
+                     fill_price - trigger_price)
+        with _tick_lock:
+            _mark_closed(pos, fill_price, reason)
+            _save_positions()
+        _notify_close(pos)
+        return
+
+    residual = _check_ib_residual(pos)
+    if residual > 0:
+        log.error("[IB] %s: SELL FAILED — %d contracts still in IB. "
+                  "Reverting to FILLED for retry.", pos.ticker, residual)
+        with _tick_lock:
+            pos.status = "FILLED"
+            pos.quantity = residual
+            _closing_since.pop(pos.occ_symbol, None)
+            _save_positions()
+    elif residual == 0:
+        _unsubscribe_ib_quotes(pos.occ_symbol)
+        actual_fill = _get_recent_sell_fill(pos)
+        exit_price = actual_fill if actual_fill else trigger_price
+        if actual_fill:
+            log.info("[IB] %s: Sell filled at IB — recording actual fill $%.2f (trigger was $%.2f)",
+                     pos.ticker, actual_fill, trigger_price)
+        else:
+            log.warning("[IB] %s: Sell filled at IB but fill price unavailable — "
+                        "recording trigger $%.2f (realized P&L approximate)",
+                        pos.ticker, trigger_price)
+        with _tick_lock:
+            _mark_closed(pos, exit_price, reason)
+            _save_positions()
+        _notify_close(pos)
+    else:
+        log.error("[IB] %s: SELL FAILED and could not verify IB state. "
+                  "Reverting to FILLED for safety.", pos.ticker)
+        with _tick_lock:
+            pos.status = "FILLED"
+            _closing_since.pop(pos.occ_symbol, None)
+            _save_positions()
 
 
 # ---------------------------------------------------------------------------
@@ -1079,7 +1245,7 @@ def place_paper_trade(result) -> Optional[PaperPosition]:
             log.error("[IB] %s: Could not qualify contract %s — skipping", result.ticker, occ_symbol)
             _send_paper_telegram(
                 f"⚠️ <b>CONTRACT NOT FOUND</b>\n"
-                f"{result.ticker} {option_type} ${strike:.0f} exp {expiry[:10]}\n"
+                f"{result.ticker} {option_type} ${fmt_strike(strike)} exp {expiry[:10]}\n"
                 f"IB cannot qualify {occ_symbol}"
             )
             pos.status = "REJECTED"
@@ -1127,7 +1293,7 @@ def place_paper_trade(result) -> Optional[PaperPosition]:
         )
         _send_paper_telegram(
             f"\U0001f4c4 <b>IB PAPER TRADE OPENED</b>\n"
-            f"{result.ticker} {option_type} ${strike:.0f} exp {expiry[:10]}\n"
+            f"{result.ticker} {option_type} ${fmt_strike(strike)} exp {expiry[:10]}\n"
             f"Limit: ${limit_price:.2f} | {result.conviction}\n"
             f"TP: {pos.premium_target_pct:+.0f}% | Stop: {pos.premium_stop_pct:+.0f}% | "
             f"Trail: {pos.trail_activate_pct:.0f}%/{pos.trail_stop_pct:.0f}%"
@@ -1136,7 +1302,7 @@ def place_paper_trade(result) -> Optional[PaperPosition]:
         log.error("[IB] %s: Order failed — %s", result.ticker, e)
         _send_paper_telegram(
             f"\U0001f6a8 <b>ORDER FAILED</b>\n"
-            f"{result.ticker} {option_type} ${strike:.0f} exp {expiry[:10]}\n"
+            f"{result.ticker} {option_type} ${fmt_strike(strike)} exp {expiry[:10]}\n"
             f"Error: {str(e)[:100]}"
         )
         pos.status = "REJECTED"
@@ -1287,7 +1453,7 @@ def place_leap_trade(result, trade_plan) -> Optional[PaperPosition]:
         )
         _send_paper_telegram(
             f"\U0001f4c4 <b>IB LEAP TRADE OPENED</b>\n"
-            f"{result.ticker} {option_type} ${strike:.0f} exp {expiry[:10]}\n"
+            f"{result.ticker} {option_type} ${fmt_strike(strike)} exp {expiry[:10]}\n"
             f"Limit: ${mid_price:.2f} | {result.conviction}"
         )
     except Exception as e:
@@ -1376,7 +1542,7 @@ def _check_pending_order(pos: PaperPosition, now: datetime):
                         )
                         _send_paper_telegram(
                             f"✅ <b>IB PAPER FILL</b>\n"
-                            f"{pos.ticker} {pos.option_type} ${pos.strike:.0f} exp {pos.expiry}\n"
+                            f"{pos.ticker} {pos.option_type} ${fmt_strike(pos.strike)} exp {pos.expiry}\n"
                             f"Filled @ ${avg_price:.2f}"
                         )
                         _subscribe_ib_quotes(pos.occ_symbol)
@@ -1424,7 +1590,7 @@ def _check_pending_order(pos: PaperPosition, now: datetime):
                         )
                         _send_paper_telegram(
                             f"⚠️ <b>PARTIAL FILL DETECTED</b>\n"
-                            f"{pos.ticker} {pos.option_type} ${pos.strike:.0f} exp {pos.expiry}\n"
+                            f"{pos.ticker} {pos.option_type} ${fmt_strike(pos.strike)} exp {pos.expiry}\n"
                             f"Order {status} but {residual} contracts filled @ ${pos.filled_price:.2f}\n"
                             f"Now tracking with full risk management."
                         )
@@ -1446,9 +1612,13 @@ def _check_pending_order(pos: PaperPosition, now: datetime):
                         )
 
                 elif status in ("presubmitted", "submitted"):
-                    stale_hours = 48 if pos.strategy_type == "LEAP" else 4
+                    # Swing entries must fill promptly or be cancelled — a late fill
+                    # lands at a stale, off-market price (a churned-entry loss cause;
+                    # e.g. an order that sat 9 min then filled ~10% above market).
+                    # LEAPs are far less time-sensitive, so they keep a long leash.
+                    timeout_secs = 48 * 3600 if pos.strategy_type == "LEAP" else ENTRY_FILL_TIMEOUT_SECS
                     opened = datetime.fromisoformat(pos.opened_at) if pos.opened_at else now
-                    if (now - opened).total_seconds() > stale_hours * 3600:
+                    if (now - opened).total_seconds() > timeout_secs:
                         try:
                             _ib_run(lambda t=trade: ib.cancelOrder(t.order), timeout=15)
                             time.sleep(1)
@@ -1486,7 +1656,7 @@ def _check_pending_order(pos: PaperPosition, now: datetime):
                                             pos.ticker, residual)
                                 _send_paper_telegram(
                                     f"⚠️ <b>PARTIAL FILL ON STALE CANCEL</b>\n"
-                                    f"{pos.ticker} {pos.option_type} ${pos.strike:.0f} exp {pos.expiry}\n"
+                                    f"{pos.ticker} {pos.option_type} ${fmt_strike(pos.strike)} exp {pos.expiry}\n"
                                     f"Stale order canceled but {residual} contracts filled @ ${pos.filled_price:.2f}\n"
                                     f"Now tracking with full risk management."
                                 )
@@ -1628,40 +1798,7 @@ def check_and_manage_positions(ticker: str = None):
         _save_positions()
 
     for pos, trigger_price, reason in close_queue:
-        fill_price = _submit_ib_sell(pos, trigger_price=trigger_price)
-        if fill_price:
-            _unsubscribe_ib_quotes(pos.occ_symbol)
-            if abs(fill_price - trigger_price) > 0.005:
-                log.info("[IB] %s: Fill $%.2f vs trigger $%.2f (diff=$%.2f)",
-                         pos.ticker, fill_price, trigger_price,
-                         fill_price - trigger_price)
-            with _tick_lock:
-                _mark_closed(pos, fill_price, reason)
-                _save_positions()
-            _notify_close(pos)
-        else:
-            residual = _check_ib_residual(pos)
-            if residual > 0:
-                log.error("[IB] %s: SELL FAILED — %d contracts still in IB. "
-                          "Reverting to FILLED for retry.", pos.ticker, residual)
-                with _tick_lock:
-                    pos.status = "FILLED"
-                    pos.quantity = residual
-                    _closing_since.pop(pos.occ_symbol, None)
-                    _save_positions()
-            elif residual == 0:
-                _unsubscribe_ib_quotes(pos.occ_symbol)
-                with _tick_lock:
-                    _mark_closed(pos, trigger_price, reason)
-                    _save_positions()
-                _notify_close(pos)
-            else:
-                log.error("[IB] %s: SELL FAILED and could not verify IB state. "
-                          "Reverting to FILLED for safety.", pos.ticker)
-                with _tick_lock:
-                    pos.status = "FILLED"
-                    _closing_since.pop(pos.occ_symbol, None)
-                    _save_positions()
+        _close_via_sell(pos, trigger_price, reason)
 
     stuck_closing = [p for p in _positions if p.status == "CLOSING"]
     for pos in stuck_closing:
@@ -1681,8 +1818,11 @@ def check_and_manage_positions(ticker: str = None):
             log.info("[IB] %s: Stuck CLOSING %.0fs — position gone from IB, marking CLOSED",
                      pos.ticker, closing_age)
             _unsubscribe_ib_quotes(pos.occ_symbol)
+            actual_fill = _get_recent_sell_fill(pos)
             with _tick_lock:
-                price = prices.get(pos.occ_symbol) or pos.filled_price or 0
+                price = actual_fill or prices.get(pos.occ_symbol) or pos.filled_price or 0
+                if actual_fill:
+                    log.info("[IB] %s: Recording actual sell fill $%.2f", pos.ticker, actual_fill)
                 _mark_closed(pos, price, pos.close_reason or "recovered from stuck CLOSING")
                 _save_positions()
             _notify_close(pos)
@@ -1847,8 +1987,24 @@ def check_flow_contradiction(result, min_conviction: str = "MEDIUM"):
                       f"(score={result.composite_score:.0f}, direction={new_dir.value})")
 
         if pos.status == "PENDING":
+            # Not filled yet — cancelling on a contradiction is correct (don't
+            # enter a trade whose thesis just flipped).
             actions.append(("cancel", pos, reason, None))
         else:
+            # FILLED: minimum-hold guard. A contradicting re-analysis seconds
+            # after entry is almost always signal noise, and exiting instantly
+            # just pays the round-trip cost (the churn that bled the account).
+            # Hold through it — the price-based stop still protects a real move.
+            if pos.filled_at:
+                try:
+                    held_min = (datetime.now() - datetime.fromisoformat(pos.filled_at)).total_seconds() / 60
+                except Exception:
+                    held_min = 9999
+                if held_min < CONTRADICTION_MIN_HOLD_MIN:
+                    log.info("[IB] %s: Contradiction (%s) but held only %.1f min "
+                             "(< %d) — keeping position; stop-loss still active.",
+                             pos.ticker, reason[:45], held_min, CONTRADICTION_MIN_HOLD_MIN)
+                    continue
             current_price = _get_current_option_price(pos)
             if current_price is None:
                 log.warning("[IB] %s: Cannot get price for contradiction close", pos.ticker)
@@ -1948,8 +2104,10 @@ def check_flow_contradiction(result, min_conviction: str = "MEDIUM"):
                             _save_positions()
                     elif residual == 0:
                         _unsubscribe_ib_quotes(pos.occ_symbol)
+                        actual_fill = _get_recent_sell_fill(pos)
                         with _tick_lock:
-                            _mark_closed(pos, fill_price or 0, reason + " (cancel race — filled before cancel)")
+                            _mark_closed(pos, actual_fill or fill_price or 0,
+                                         reason + " (cancel race — filled before cancel)")
                             _save_positions()
                         _notify_close(pos)
                     else:
@@ -1973,43 +2131,14 @@ def check_flow_contradiction(result, min_conviction: str = "MEDIUM"):
                 )
                 _send_paper_telegram(
                     f"⚠️ <b>FLOW CONTRADICTION — ORDER CANCELLED</b>\n"
-                    f"{pos.ticker} {pos.option_type} ${pos.strike:.0f} exp {pos.expiry}\n"
+                    f"{pos.ticker} {pos.option_type} ${fmt_strike(pos.strike)} exp {pos.expiry}\n"
                     f"{reason}"
                 )
         except Exception as e:
             log.error("[IB] %s: Failed to cancel on contradiction: %s", pos.ticker, e)
 
     for pos, price, reason in close_queue:
-        fill_price = _submit_ib_sell(pos, trigger_price=price)
-        if fill_price:
-            _unsubscribe_ib_quotes(pos.occ_symbol)
-            with _tick_lock:
-                _mark_closed(pos, fill_price, reason)
-                _save_positions()
-            _notify_close(pos)
-        else:
-            residual = _check_ib_residual(pos)
-            if residual > 0:
-                log.error("[IB] %s: SELL FAILED — %d contracts still in IB. "
-                          "Reverting to FILLED.", pos.ticker, residual)
-                with _tick_lock:
-                    pos.status = "FILLED"
-                    pos.quantity = residual
-                    _closing_since.pop(pos.occ_symbol, None)
-                    _save_positions()
-            elif residual == 0:
-                _unsubscribe_ib_quotes(pos.occ_symbol)
-                with _tick_lock:
-                    _mark_closed(pos, price, reason)
-                    _save_positions()
-                _notify_close(pos)
-            else:
-                log.error("[IB] %s: SELL FAILED and could not verify IB state. "
-                          "Reverting to FILLED for safety.", pos.ticker)
-                with _tick_lock:
-                    pos.status = "FILLED"
-                    _closing_since.pop(pos.occ_symbol, None)
-                    _save_positions()
+        _close_via_sell(pos, price, reason)
 
 
 # ---------------------------------------------------------------------------
@@ -2227,52 +2356,17 @@ def _process_tick_updates(updates: list, now: datetime):
             _save_positions()
 
     for pos, occ, trigger_price, reason in close_queue:
-        fill_price = _submit_ib_sell(pos, trigger_price=trigger_price)
-
-        if fill_price:
-            _unsubscribe_ib_quotes(occ)
-            exit_price = fill_price
-            if abs(fill_price - trigger_price) > 0.005:
-                log.info("[IB] %s: Fill $%.2f vs trigger $%.2f (diff=$%.2f)",
-                         pos.ticker, fill_price, trigger_price,
-                         fill_price - trigger_price)
-            with _tick_lock:
-                _mark_closed(pos, exit_price, reason)
-                _save_positions()
-            _notify_close(pos)
-        else:
-            residual = _check_ib_residual(pos)
-            if residual > 0:
-                log.error(
-                    "[IB] %s: SELL FAILED — %d contracts still in IB. "
-                    "Reverting to FILLED for retry.",
-                    pos.ticker, residual)
-                with _tick_lock:
-                    pos.status = "FILLED"
-                    pos.quantity = residual
-                    _closing_since.pop(pos.occ_symbol, None)
-                    _save_positions()
-            elif residual == 0:
-                _unsubscribe_ib_quotes(occ)
-                with _tick_lock:
-                    _mark_closed(pos, trigger_price, reason)
-                    _save_positions()
-                _notify_close(pos)
-            else:
-                log.error(
-                    "[IB] %s: SELL FAILED and could not verify IB state. "
-                    "Reverting to FILLED for safety.", pos.ticker)
-                with _tick_lock:
-                    pos.status = "FILLED"
-                    _closing_since.pop(pos.occ_symbol, None)
-                    _save_positions()
+        _close_via_sell(pos, trigger_price, reason)
 
 
-async def start_option_stream():
+async def start_option_stream(on_connect=None):
     """Start IB streaming quotes for all filled positions via reqMktData.
 
     Uses a dedicated IB connection (clientId+1) so streaming doesn't
     compete with order placement on the main connection.
+
+    on_connect: optional callback invoked after a successful connection
+    (used by the caller to send reconnect alerts).
     """
     global _stream_ib, _stream_loop
     if _stream_ib:
@@ -2291,13 +2385,12 @@ async def start_option_stream():
         _stream_ib = ib
         _stream_loop = asyncio.get_event_loop()
         log.info("[IB-STREAM] \U0001f4ca Streaming connection established (clientId=%d)", IB_CLIENT_ID + 1)
-        _send_paper_telegram(
-            "\U0001f7e2 <b>IB STREAM CONNECTED</b>\n"
-            "Real-time exit monitoring is active."
-        )
     except Exception as e:
         log.error("[IB-STREAM] Failed to connect: %s", e)
         raise
+
+    if on_connect:
+        on_connect()
 
     _subscribed_contracts.clear()
 
@@ -2318,12 +2411,6 @@ async def start_option_stream():
         if not ib.isConnected():
             _stream_ib = None
             _stream_loop = None
-            _send_paper_telegram(
-                "\U0001f534 <b>IB STREAM DISCONNECTED</b>\n"
-                "Real-time exit monitoring is DOWN.\n"
-                "Positions are UNMANAGED until reconnect.\n"
-                "Check TWS/IB Gateway."
-            )
             raise ConnectionError("IB streaming connection lost")
 
 
@@ -2412,7 +2499,7 @@ def _process_order_status(order_id_str: str, status: str, avg_price: float):
         )
         _send_paper_telegram(
             f"✅ <b>IB PAPER FILL</b>\n"
-            f"{pos.ticker} {pos.option_type} ${pos.strike:.0f} exp {pos.expiry}\n"
+            f"{pos.ticker} {pos.option_type} ${fmt_strike(pos.strike)} exp {pos.expiry}\n"
             f"Filled @ ${fill_price:.2f}"
         )
         _subscribe_ib_quotes(pos.occ_symbol)
@@ -2469,7 +2556,7 @@ def _process_order_status(order_id_str: str, status: str, avg_price: float):
             )
             _send_paper_telegram(
                 f"⚠️ <b>PARTIAL FILL DETECTED</b>\n"
-                f"{pos.ticker} {pos.option_type} ${pos.strike:.0f} exp {pos.expiry}\n"
+                f"{pos.ticker} {pos.option_type} ${fmt_strike(pos.strike)} exp {pos.expiry}\n"
                 f"Order {cancel_status} but {residual} contracts filled @ ${pos.filled_price:.2f}\n"
                 f"Now tracking with full risk management."
             )
@@ -2494,12 +2581,15 @@ def _process_order_status(order_id_str: str, status: str, avg_price: float):
 _trade_stream_ib = None
 
 
-async def start_trade_stream():
+async def start_trade_stream(on_connect=None):
     """Monitor IB order status changes for real-time fill detection.
 
     Uses a dedicated IB connection (clientId+2) established in the async
     context so ib_insync integrates with the asyncio event loop and
     orderStatusEvent fires immediately — not only during ib.sleep() calls.
+
+    on_connect: optional callback invoked after a successful connection
+    (used by the caller to send reconnect alerts).
     """
     global _trade_stream_ib
     if _trade_stream_ib:
@@ -2517,6 +2607,9 @@ async def start_trade_stream():
         log.info("[IB] \U0001f534 Order status monitoring active (clientId=%d)", IB_CLIENT_ID + 2)
     except Exception as e:
         raise ConnectionError(f"IB trade stream connection failed: {e}")
+
+    if on_connect:
+        on_connect()
 
     await ib.reqAllOpenOrdersAsync()
     ib.orderStatusEvent += lambda trade: _on_order_status(trade)
@@ -2557,7 +2650,7 @@ def _reconcile_eod():
     for (sym, strike, right), qty in ib_pos.items():
         key = (sym, strike, right)
         if key not in bot_keys:
-            mismatches.append(f"  ⚠️ {sym} ${strike:.0f} {'CALL' if right == 'C' else 'PUT'}: "
+            mismatches.append(f"  ⚠️ {sym} ${fmt_strike(strike)} {'CALL' if right == 'C' else 'PUT'}: "
                               f"IB has {qty} contracts, bot has NONE")
 
     for key, positions in bot_keys.items():
@@ -2663,7 +2756,7 @@ def send_eod_report():
         emoji = "\U0001f7e2" if pnl_pct > 0 else "\U0001f534"
         reason = (c.get("close_reason") or "")[:35]
         realized_lines.append(
-            f"  {emoji} {c['ticker']} {c.get('option_type','')} ${c.get('strike',0):.0f} "
+            f"  {emoji} {c['ticker']} {c.get('option_type','')} ${fmt_strike(c.get('strike',0))} "
             f"→ {pnl_pct:+.1f}% (${pnl_dollar:+,.0f}) {reason}"
         )
 
@@ -2680,7 +2773,7 @@ def send_eod_report():
         total_unrealized += pnl_dollar
         emoji = "\U0001f7e2" if pnl_pct > 0 else "\U0001f534"
         unrealized_lines.append(
-            f"  {emoji} {pos.ticker} {pos.option_type} ${pos.strike:.0f} "
+            f"  {emoji} {pos.ticker} {pos.option_type} ${fmt_strike(pos.strike)} "
             f"→ {pnl_pct:+.1f}% (${pnl_dollar:+,.0f})"
         )
 

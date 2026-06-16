@@ -12,6 +12,7 @@ from enum import Enum
 import httpx
 from dotenv import load_dotenv
 import db as persistence
+from db import fmt_strike
 
 load_dotenv()
 
@@ -1874,7 +1875,7 @@ def compute_trade_plan(result: StrategyResult, regime: str = None) -> TradePlan:
             f"at this strike/expiry"
         )
         if flow_strike and flow_strike != tp.suggested_strike:
-            tp.strike_reason += f" (top flow was ${flow_strike:.0f})"
+            tp.strike_reason += f" (top flow was ${fmt_strike(flow_strike)})"
 
     if not best_flow:
         from datetime import datetime as _dt, timedelta as _td
@@ -2013,13 +2014,13 @@ def compute_leap_trade_plan(result: StrategyResult, leap_prints: list) -> Option
     tp.strike_reason = (
         f"LEAP: following ${total_prem:,.0f} across {len(leap_prints)} prints — "
         f"biggest ${float(best_print.get('premium', 0)):,.0f} "
-        f"{best_print.get('option_type', '')} at ${tp.suggested_strike:.0f}"
+        f"{best_print.get('option_type', '')} at ${fmt_strike(tp.suggested_strike)}"
     )
 
     moneyness = "ITM" if is_itm else "OTM"
     log.info(
         f"[LEAP] {result.ticker}: Plan — {tp.suggested_dte} | "
-        f"Strike=${tp.suggested_strike:.0f} ({abs_dist:.0%} {moneyness}) | "
+        f"Strike=${fmt_strike(tp.suggested_strike)} ({abs_dist:.0%} {moneyness}) | "
         f"Stop=${tp.stop_price:.2f} (-{tp.stop_pct:.0f}%) | "
         f"No fixed TP | Trail +{tp.trail_activate_pct:.0f}%/{tp.trail_stop_pct:.0f}% | "
         f"Prem stop={tp.premium_stop_pct:.0f}%"
@@ -2057,7 +2058,7 @@ def send_leap_telegram_alert(ticker: str, leap_prints: list,
     msg = (
         f"🔭 <b>LEAP SIGNAL</b>\n\n"
         f"<b>{ticker}</b> — {direction}\n"
-        f"${strike:.0f} {option_type} exp {expiry} ({trade_plan.suggested_dte})\n\n"
+        f"${fmt_strike(strike)} {option_type} exp {expiry} ({trade_plan.suggested_dte})\n\n"
         f"📊 <b>Accumulation (5 days)</b>\n"
         f"• {n_prints} prints | ${total_premium:,.0f} total\n"
         f"• {sweep_count} sweeps | Bull ${bull_prem:,.0f} / Bear ${bear_prem:,.0f}\n\n"
@@ -2187,7 +2188,7 @@ def compute_earnings_trade_plan(result: StrategyResult, earnings_prints: list,
     moneyness = "ITM" if is_itm else "OTM"
     log.info(
         f"[EARN] {result.ticker}: Plan — {tp.suggested_dte} | "
-        f"Strike=${tp.suggested_strike:.0f} ({abs_dist:.0%} {moneyness}) | "
+        f"Strike=${fmt_strike(tp.suggested_strike)} ({abs_dist:.0%} {moneyness}) | "
         f"Stop=${tp.stop_price:.2f} (-{tp.stop_pct:.0f}%) | "
         f"Max hold={tp.max_hold_days}d (exit before earnings {earnings_date}) | "
         f"Trail +{tp.trail_activate_pct:.0f}%/{tp.trail_stop_pct:.0f}%"
@@ -2501,7 +2502,7 @@ def print_report(result: StrategyResult):
         if tp.suggested_strike:
             contract_type = "call" if result.direction == Signal.BULLISH else "put"
             print(f"\n  SUGGESTED CONTRACT:")
-            print(f"  📋 ${tp.suggested_strike:.0f} {contract_type}, {tp.suggested_expiry} ({tp.suggested_dte})")
+            print(f"  📋 ${fmt_strike(tp.suggested_strike)} {contract_type}, {tp.suggested_expiry} ({tp.suggested_dte})")
             print(f"     Delta ≈{tp.suggested_delta:.2f} → {tp.option_leverage}x leverage")
             if tp.strike_reason:
                 print(f"     Why: {tp.strike_reason}")
@@ -2531,13 +2532,13 @@ def print_report(result: StrategyResult):
 
 def _get_spy_regime(spy_prices: dict, date: str) -> str:
     """Determine market regime from SPY prices. Returns 'BULLISH', 'BEARISH', or 'NEUTRAL'.
-    Uses 20-day SMA: price above = BULLISH, below = BEARISH."""
+    Uses 20-day SMA of PRIOR closes: price above = BULLISH, below = BEARISH."""
     sorted_dates = sorted(d for d in spy_prices if d <= date)
-    if len(sorted_dates) < 20:
+    if len(sorted_dates) < 21:
         return "NEUTRAL"
-    recent_20 = sorted_dates[-20:]
-    sma_20 = sum(spy_prices[d]["close"] for d in recent_20) / 20
     current_close = spy_prices[sorted_dates[-1]]["close"]
+    prior_20 = sorted_dates[-21:-1]
+    sma_20 = sum(spy_prices[d]["close"] for d in prior_20) / 20
     if current_close > sma_20 * 1.01:
         return "BULLISH"
     elif current_close < sma_20 * 0.99:
@@ -2961,7 +2962,7 @@ def format_telegram_message(result: StrategyResult) -> str:
             ct = "call" if result.direction == Signal.BULLISH else "put"
             lines.append(f"")
             lines.append(f"<b>Contract</b>")
-            lines.append(f"📋 ${tp.suggested_strike:.0f} {ct}, {tp.suggested_expiry} ({tp.suggested_dte})")
+            lines.append(f"📋 ${fmt_strike(tp.suggested_strike)} {ct}, {tp.suggested_expiry} ({tp.suggested_dte})")
             lines.append(f"  δ≈{tp.suggested_delta:.2f} → {tp.option_leverage}x leverage")
         lines.append(f"")
         lines.append(f"<b>Option Mgmt</b>")
@@ -3542,7 +3543,7 @@ class LiveMonitor:
         sweep_label = "SWEEP" if is_sweep else "BLOCK"
         log.info(
             f"[LEAP] 🔭 {ticker}: {sweep_label} {option_type} ${premium:,.0f} | "
-            f"Strike=${strike:.0f} Exp={expiry} {dte}DTE | {side} → {sentiment}"
+            f"Strike=${fmt_strike(strike)} Exp={expiry} {dte}DTE | {side} → {sentiment}"
         )
 
         try:
@@ -3581,7 +3582,7 @@ class LiveMonitor:
         sweep_label = "SWEEP" if is_sweep else "BLOCK"
         log.info(
             f"[EARN] 📊 {ticker}: {sweep_label} {option_type} ${premium:,.0f} | "
-            f"Strike=${strike:.0f} Exp={expiry} {dte}DTE | {side} → {sentiment} | "
+            f"Strike=${fmt_strike(strike)} Exp={expiry} {dte}DTE | {side} → {sentiment} | "
             f"Earnings={earnings_date}"
         )
 
@@ -3640,7 +3641,7 @@ class LiveMonitor:
             log.warning(
                 f"[EXIT] ⚠️ {ticker}: Bid-side exit flow detected — "
                 f"{option_type} ${bid_prem:,.0f} bid / ${total_prem:,.0f} total "
-                f"({bid_pct:.0%}) | We hold {pos.option_type} ${pos.strike:.0f}"
+                f"({bid_pct:.0%}) | We hold {pos.option_type} ${fmt_strike(pos.strike)}"
             )
 
             self._exit_flow_cooldown[ticker] = datetime.now()
@@ -4014,16 +4015,63 @@ class LiveMonitor:
                 log.error(f"[LIVE] EOD report error: {e}")
                 await asyncio.sleep(60)
 
+    # Tracks which streams are currently down, so we alert once on failure
+    # and once on recovery — not on every retry cycle.
+    _stream_down: dict[str, bool] = {}
+
+    def _post_telegram(self, msg: str):
+        try:
+            httpx.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"},
+                timeout=10,
+            )
+        except Exception:
+            pass
+
+    def _alert_stream_down(self, stream_name: str, error: str):
+        """Alert once when a stream goes down (suppresses spam across retries)."""
+        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+            return
+        if self._stream_down.get(stream_name):
+            return
+        self._stream_down[stream_name] = True
+        hint = ("Check TWS/IB Gateway if this persists." if stream_name.startswith("IB")
+                else "Check internet / UW data feed if this persists.")
+        extra = ("\nReal-time exit monitoring is DOWN — positions are UNMANAGED until reconnect."
+                 if stream_name == "IB OPTION STREAM" else "")
+        self._post_telegram(
+            f"\U0001f534 <b>{stream_name} DOWN</b>\n"
+            f"{error}{extra}\n"
+            f"Bot will keep retrying. {hint}"
+        )
+
+    def _alert_stream_up(self, stream_name: str):
+        """Alert when a previously-down stream reconnects. No-op on first connect."""
+        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+            return
+        if not self._stream_down.get(stream_name):
+            return  # never went down (e.g. clean startup) — stay quiet
+        self._stream_down[stream_name] = False
+        self._post_telegram(
+            f"\U0001f7e2 <b>{stream_name} RECONNECTED</b>\n"
+            f"Stream is back online."
+        )
+
     async def _trade_stream_loop(self):
         broker = _get_broker_module()
         backoff = 5
         while self._running:
+            def _on_connect():
+                nonlocal backoff
+                backoff = 5
+                self._alert_stream_up("IB TRADE STREAM")
             try:
                 log.info(f"[LIVE] 🔴 Starting {'IB'} real-time trade stream")
-                await broker.start_trade_stream()
-                backoff = 5
+                await broker.start_trade_stream(on_connect=_on_connect)
             except Exception as e:
                 log.error(f"[LIVE] Trade stream error (reconnecting in {backoff}s): {e}")
+                self._alert_stream_down("IB TRADE STREAM", str(e))
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60)
 
@@ -4031,21 +4079,24 @@ class LiveMonitor:
         broker = _get_broker_module()
         backoff = 5
         while self._running:
+            def _on_connect():
+                nonlocal backoff
+                backoff = 5
+                self._alert_stream_up("IB OPTION STREAM")
             try:
                 log.info(f"[LIVE] 📊 Starting {'IB'} real-time option quote stream")
-                await broker.start_option_stream()
-                backoff = 5
+                await broker.start_option_stream(on_connect=_on_connect)
             except ValueError as e:
                 if "connection limit" in str(e).lower():
                     log.warning(f"[LIVE] Option stream connection limit exceeded, retrying in {backoff}s")
-                    await asyncio.sleep(backoff)
-                    backoff = min(backoff * 2, 60)
                 else:
                     log.error(f"[LIVE] Option stream auth error (retrying in {backoff}s): {e}")
-                    await asyncio.sleep(backoff)
-                    backoff = min(backoff * 2, 60)
+                self._alert_stream_down("IB OPTION STREAM", str(e))
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
             except Exception as e:
                 log.error(f"[LIVE] Option stream error (reconnecting in {backoff}s): {e}")
+                self._alert_stream_down("IB OPTION STREAM", str(e))
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60)
 
@@ -4108,6 +4159,7 @@ class LiveMonitor:
             try:
                 async with websockets.connect(ws_url, ping_interval=30, ping_timeout=10) as ws:
                     log.info("[LIVE] ✅ WebSocket connected")
+                    self._alert_stream_up("UW WEBSOCKET")
 
                     await ws.send(json.dumps({"channel": "flow-alerts", "msg_type": "join"}))
                     await ws.send(json.dumps({"channel": "off_lit_trades", "msg_type": "join"}))
@@ -4153,6 +4205,7 @@ class LiveMonitor:
                 break
             except Exception as e:
                 log.error(f"[LIVE] WebSocket error: {e}")
+                self._alert_stream_down("UW WEBSOCKET", str(e))
                 if not self._running:
                     break
                 log.info(f"[LIVE] Reconnecting in {reconnect_delay}s...")
